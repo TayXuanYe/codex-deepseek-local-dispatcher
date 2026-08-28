@@ -1,0 +1,35 @@
+{
+  "mcpServers": {
+    "deepseek_dispatcher": {
+      "command": "cmd.exe",
+      "args": [
+        "/d",
+        "/s",
+        "/c",
+        "call",
+        "./scripts/launch_dispatcher.cmd",
+        "./scripts/server.mjs"
+      ],
+      "cwd": ".",
+      "enabled": true,
+      "env_vars": [
+        "CODEX_MCP_NODE_PATH",
+        "CODEX_BROWSER_USE_NODE_PATH",
+        "CODEX_ELECTRON_RESOURCES_PATH",
+        "CODEX_CLI_PATH",
+        "CODEX_HOME",
+        "USERPROFILE",
+        "LOCALAPPDATA",
+        "APPDATA",
+        "PATH",
+        "TEMP",
+        "TMP",
+        "DEEPSEEK_API_KEY",
+        "DEEPSEEK_DISPATCHER_ALLOWED_ROOTS",
+        "DEEPSEEK_DISPATCHER_MAX_OUTPUT_BYTES"
+      ],
+      "startup_timeout_sec": 15,
+      "tool_timeout_sec": 1860
+    }
+  }
+}

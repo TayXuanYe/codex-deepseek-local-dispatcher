@@ -1,0 +1,24 @@
+{
+  "name": "deepseek-local-dispatcher",
+  "version": "0.1.0+codex.20260827125529",
+  "description": "Bounded local MCP dispatcher for DeepSeek coding and vision workers.",
+  "author": {
+    "name": "Local developer"
+  },
+  "interface": {
+    "displayName": "DeepSeek Local Dispatcher",
+    "shortDescription": "Run fixed DeepSeek workers through local Codex CLI.",
+    "longDescription": "Exposes bounded coding and vision tools that invoke fixed DeepSeek models through a local, sandboxed Codex CLI process.",
+    "developerName": "Local developer",
+    "category": "Productivity",
+    "capabilities": [
+      "Read",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "Use DeepSeek to implement this approved change.",
+      "Use DeepSeek Vision to inspect these screenshots."
+    ]
+  },
+  "mcpServers": "./.mcp.json"
+}
