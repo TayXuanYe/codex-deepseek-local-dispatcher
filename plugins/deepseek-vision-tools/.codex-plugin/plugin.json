@@ -1,0 +1,23 @@
+{
+  "name": "deepseek-vision-tools",
+  "version": "0.1.0+codex.20260825043116",
+  "description": "Defensive local thumbnail, tile, and crop tools for progressive vision inspection.",
+  "author": {
+    "name": "Local developer"
+  },
+  "interface": {
+    "displayName": "DeepSeek Vision Tools",
+    "shortDescription": "Inspect large images progressively and safely.",
+    "longDescription": "Creates a bounded overview first, then retrieves only the high-resolution tiles or crops needed for visual analysis.",
+    "developerName": "Local developer",
+    "category": "Productivity",
+    "capabilities": [
+      "Read"
+    ],
+    "defaultPrompt": [
+      "Inspect this screenshot progressively.",
+      "Find the relevant region, then inspect its details."
+    ]
+  },
+  "mcpServers": "./.mcp.json"
+}

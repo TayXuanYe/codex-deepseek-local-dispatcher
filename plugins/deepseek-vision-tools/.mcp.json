@@ -1,0 +1,35 @@
+{
+  "mcpServers": {
+    "deepseek_vision": {
+      "command": "cmd.exe",
+      "args": [
+        "/d",
+        "/s",
+        "/c",
+        "call",
+        "./scripts/launch_image_tools_mcp.cmd",
+        "./scripts/server.mjs"
+      ],
+      "cwd": ".",
+      "enabled": true,
+      "env_vars": [
+        "CODEX_MCP_NODE_PATH",
+        "CODEX_BROWSER_USE_NODE_PATH",
+        "CODEX_ELECTRON_RESOURCES_PATH",
+        "CODEX_CLI_PATH",
+        "USERPROFILE",
+        "LOCALAPPDATA",
+        "PATH",
+        "DEEPSEEK_VISION_CACHE_DIR",
+        "DEEPSEEK_VISION_MAX_SOURCE_PIXELS",
+        "DEEPSEEK_VISION_MAX_SOURCE_DIMENSION",
+        "DEEPSEEK_VISION_CACHE_MAX_AGE_HOURS",
+        "DEEPSEEK_VISION_ALLOWED_ROOTS",
+        "DEEPSEEK_VISION_MAX_IMAGE_OUTPUT_BYTES",
+        "DEEPSEEK_VISION_MAX_TOOL_OUTPUT_BYTES"
+      ],
+      "startup_timeout_sec": 15,
+      "tool_timeout_sec": 120
+    }
+  }
+}
