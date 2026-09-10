@@ -1,11 +1,18 @@
 # DeepSeek Local Dispatcher
 
-This local STDIO MCP plugin invokes fixed DeepSeek models through `codex exec`:
+This local STDIO MCP plugin invokes the fixed unified DeepSeek Flash model
+(`deepseek-flash`, a single officially released multimodal generator that
+accepts text and image input) through `codex exec`:
 
-- `run_deepseek_task` → `deepseek-v4-flash`
-- `run_deepseek_vision` → `deepseek-v4-flash-vision-exp`
+- `run_deepseek_task` → `deepseek-flash` (coding entry point)
+- `run_deepseek_vision` → `deepseek-flash` (vision entry point)
 - `deepseek_dispatcher_status` → configuration health without secret values
 - `deepseek_grant_instructions` → read-only two-step flow for one-time path grants
+
+Both entry points use the same model ID. The coding/vision split is a semantic
+role split only: `run_deepseek_vision` controls image validation, `--image`
+arguments, source-image protection, read-only defaults, workspace-write
+boundaries, and visual prompt specialization.
 
 It is a compatibility bridge for environments where ChatGPT-account subagent execution rejects external models. It is not a native subagent thread and does not provide native follow-up or thread UI.
 
@@ -69,9 +76,13 @@ owns the workspace, so reading an external image before owning the grant would
 violate that boundary, and invalid images therefore consume the grant and
 require a new human-approved grant. For a workspace already inside the static
 roots no grant is needed, and an extra `grant_token` is ignored and left
-unconsumed. Images must always stay inside the static roots (inside-root case)
-or inside the authorized grant workspace (grant case); a grant never authorizes
-a parent or sibling path.
+unconsumed. Read-only Vision images must stay inside the static roots
+(inside-root case) or inside the authorized grant workspace (grant case); a
+grant never authorizes a parent or sibling path. Workspace-write Vision images
+must always come from the static allowed roots — never the grant workspace —
+and must also be outside the writable workspace and the writable temporary
+roots (canonical `TEMP`, `TMP`, and Node's `os.tmpdir()`), so a workspace-write
+child can never overwrite a source image.
 
 Grant files live under `$CODEX_HOME/deepseek-dispatcher-grants`, or
 `$USERPROFILE/.codex/deepseek-dispatcher-grants` only when `CODEX_HOME` is
@@ -85,7 +96,7 @@ without following symlinks.
 
 ## Safety boundaries
 
-- The provider and both model IDs are fixed.
+- The provider and the single `deepseek-flash` model ID are fixed.
 - The tool never accepts an executable, provider, model, or raw CLI argument.
 - The grant store never persists the plaintext token, only its SHA-256 digest.
 - The helper stdout contains the plaintext token once; it may be retained in
@@ -93,7 +104,11 @@ without following symlinks.
   dispatcher and child never return or log it.
 - `deepseek_grant_instructions` is read-only and never grants access itself.
 - Coding runs default to `read-only`; `workspace-write` must be explicit.
-- Vision runs are always read-only.
+- Vision runs default to `read-only`; `workspace-write` is permitted only for an
+  approved visually relevant implementation. Source images are
+  sandbox-enforced read-only: workspace-write runs reject any image inside the
+  writable workspace or the writable temporary roots, and with a one-time grant
+  they must come from the static allowed roots rather than the grant workspace.
 - Only one DeepSeek run is active at a time.
 - Timeouts are capped at 30 minutes and captured output is bounded.
 - The child uses `--ignore-user-config` so it does not recursively load this dispatcher.

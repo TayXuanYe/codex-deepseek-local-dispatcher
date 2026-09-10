@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -23,9 +24,14 @@ const MAX_IMAGES = 5;
 const MAX_IMAGE_BYTES = 32 * 1024 * 1024;
 const MAX_TOTAL_IMAGE_BYTES = 48 * 1024 * 1024;
 
+// The officially released DeepSeek Flash model is a single unified multimodal
+// generator, so both entry points resolve to exactly one model ID. The coding
+// and vision keys are kept because `kind` still selects the entry-point
+// semantics (image validation, --image arguments, source-image protection,
+// read-only defaults, and prompt specialization).
 const MODELS = Object.freeze({
-  coding: "deepseek-v4-flash",
-  vision: "deepseek-v4-flash-vision-exp"
+  coding: "deepseek-flash",
+  vision: "deepseek-flash"
 });
 
 export class DispatcherError extends Error {
@@ -117,6 +123,30 @@ async function authorizePath(candidate, roots, expectedType, contextLabel = "DEE
     throw new DispatcherError("invalid_path", "An image path must resolve to a regular file.");
   }
   return { path: canonical, stat };
+}
+
+// Canonical writable temp roots a workspace-write child can reach. Source
+// images must never live where the child could overwrite them, so
+// workspace-write Vision rejects any image inside the writable workspace or
+// inside any canonical writable temp root (TEMP, TMP, and Node's os.tmpdir()
+// when they exist). Only directories that actually resolve are included.
+async function writableTempRoots(environment) {
+  const candidates = [];
+  for (const name of ["TEMP", "TMP"]) {
+    const value = environmentValue(environment, name);
+    if (typeof value === "string" && value.trim() !== "") candidates.push(value.trim());
+  }
+  candidates.push(os.tmpdir());
+  const roots = new Set();
+  for (const candidate of candidates) {
+    try {
+      const canonical = path.resolve(await fs.realpath(candidate));
+      if ((await fs.stat(canonical)).isDirectory()) roots.add(canonical);
+    } catch {
+      // A missing or unresolvable temp root neither expands nor restricts access.
+    }
+  }
+  return [...roots];
 }
 
 // Closes the workspace TOCTOU between authorization and execution. The run is
@@ -240,7 +270,7 @@ export async function resolveCodexExecutable(environment = process.env) {
   );
 }
 
-async function validateImages(imagePaths, roots, contextLabel = "DEEPSEEK_DISPATCHER_ALLOWED_ROOTS") {
+async function validateImages(imagePaths, roots, contextLabel = "DEEPSEEK_DISPATCHER_ALLOWED_ROOTS", forbiddenRoots = []) {
   if (!Array.isArray(imagePaths) || imagePaths.length === 0) {
     throw new DispatcherError("invalid_argument", "images must contain at least one local image path.");
   }
@@ -251,6 +281,12 @@ async function validateImages(imagePaths, roots, contextLabel = "DEEPSEEK_DISPAT
   let totalBytes = 0;
   for (const candidate of imagePaths) {
     const authorized = await authorizePath(candidate, roots, "file", contextLabel);
+    if (forbiddenRoots.some((root) => isWithin(authorized.path, root))) {
+      throw new DispatcherError(
+        "image_not_read_only",
+        "Workspace-write Vision images must be outside the writable workspace and outside the writable temporary directories, so a workspace-write child can never overwrite a source image."
+      );
+    }
     if (authorized.stat.size > MAX_IMAGE_BYTES) {
       throw new DispatcherError("image_too_large", "A local image exceeds DeepSeek's 32 MiB inline-image limit.");
     }
@@ -276,13 +312,36 @@ async function validateImages(imagePaths, roots, contextLabel = "DEEPSEEK_DISPAT
   return images;
 }
 
+async function revalidateImages(images, roots, contextLabel, forbiddenRoots) {
+  let current;
+  try {
+    current = await validateImages(images.map((image) => image.path), roots, contextLabel, forbiddenRoots);
+  } catch {
+    throw new DispatcherError(
+      "image_path_changed",
+      "An image path changed after authorization and before the DeepSeek worker could start."
+    );
+  }
+  const unchanged = current.length === images.length && current.every((image, index) => {
+    const snapshot = images[index];
+    return image.path === snapshot.path && image.bytes === snapshot.bytes && image.format === snapshot.format;
+  });
+  if (!unchanged) {
+    throw new DispatcherError(
+      "image_path_changed",
+      "An image path or file identity changed after authorization and before the DeepSeek worker could start."
+    );
+  }
+  return current;
+}
+
 function tomlString(value) {
   return JSON.stringify(String(value).replaceAll("\\", "/"));
 }
 
 export function buildCodexArgs({ model, workspacePath, mode, catalogPath, imagePaths = [] }) {
   if (![MODELS.coding, MODELS.vision].includes(model)) {
-    throw new DispatcherError("invalid_model", "The dispatcher only permits its fixed DeepSeek coding and vision models.");
+    throw new DispatcherError("invalid_model", "The dispatcher only permits its fixed unified deepseek-flash model.");
   }
   if (!["read-only", "workspace-write"].includes(mode)) {
     throw new DispatcherError("invalid_argument", "mode must be read-only or workspace-write.");
@@ -324,13 +383,17 @@ export function buildCodexArgs({ model, workspacePath, mode, catalogPath, imageP
 }
 
 function workerPrompt(kind, task, mode) {
-  if (kind === "vision") {
-    return `You are a visual inspection worker reporting to Sol. Analyze only the supplied images and the delegated question. Do not edit files. State uncertainty instead of guessing unreadable details. Return concise findings and evidence.\n\nDelegated task:\n${task}`;
-  }
   const permission = mode === "workspace-write"
     ? "You may edit only files required by the delegated task."
     : "This is a read-only run. Do not modify files.";
-  return `You are an implementation-focused coding worker reporting to Sol. Follow the delegated scope exactly, preserve existing architecture, do not broaden scope, and do not claim validation passed unless it was executed. ${permission} End with Changed, Validated, and Remaining.\n\nDelegated task:\n${task}`;
+  if (kind === "vision") {
+    const imageGuard = "Treat source images as read-only; never modify or overwrite an input image.";
+    if (mode === "workspace-write") {
+      return `You are a DeepSeek Flash visual implementation worker reporting to Sol, running the unified multimodal DeepSeek Flash generator. Analyze the supplied images and follow the delegated scope exactly. Preserve existing architecture, do not broaden scope, and do not claim validation passed unless it was executed. ${imageGuard} ${permission} End with Changed, Validated, and Remaining.\n\nDelegated task:\n${task}`;
+    }
+    return `You are a DeepSeek Flash visual inspection worker reporting to Sol, running the unified multimodal DeepSeek Flash generator. Analyze only the supplied images and the delegated question. ${permission} ${imageGuard} State uncertainty instead of guessing unreadable details. Return concise findings and evidence.\n\nDelegated task:\n${task}`;
+  }
+  return `You are a DeepSeek Flash implementation-focused coding worker reporting to Sol, running the unified multimodal DeepSeek Flash generator. Follow the delegated scope exactly, preserve existing architecture, do not broaden scope, and do not claim validation passed unless it was executed. ${permission} End with Changed, Validated, and Remaining.\n\nDelegated task:\n${task}`;
 }
 
 function controlledEnvironment(environment) {
@@ -514,7 +577,6 @@ export async function runDeepSeek({ kind, prompt, workspace_path, mode = "read-o
     DEFAULT_MAX_OUTPUT_BYTES,
     HARD_MAX_OUTPUT_BYTES
   );
-  if (kind === "vision") mode = "read-only";
   let normalizedMode;
   try {
     normalizedMode = normalizeMode(mode);
@@ -556,11 +618,31 @@ export async function runDeepSeek({ kind, prompt, workspace_path, mode = "read-o
   }
 
   const extraSecrets = typeof grant_token === "string" && grant_token ? [grant_token] : [];
-  const imageRoots = grantSnapshot ? [grantSnapshot.workspace] : roots;
-  const imageContext = grantSnapshot
+  // Image authorization depends on mode. A one-time grant authorizes only the
+  // workspace, never a parent or sibling, so workspace-write images must come
+  // from the already trusted static roots instead of the writable grant
+  // workspace; read-only grant behavior is unchanged and stays inside the grant
+  // workspace. Workspace-write additionally enforces source-image read-only at
+  // the sandbox boundary: every image must be outside the writable workspace
+  // and outside every writable temp root, because a prompt alone cannot stop a
+  // workspace-write child from overwriting an input image.
+  const imageRoots = grantSnapshot
+    ? (normalizedMode === "workspace-write" ? roots : [grantSnapshot.workspace])
+    : roots;
+  const imageContext = grantSnapshot && normalizedMode !== "workspace-write"
     ? "the authorized grant workspace"
     : "DEEPSEEK_DISPATCHER_ALLOWED_ROOTS";
-  const validatedImages = kind === "vision" ? await validateImages(images, imageRoots, imageContext) : [];
+  let validatedImages = [];
+  if (kind === "vision") {
+    const forbiddenRoots = normalizedMode === "workspace-write"
+      ? [workspace.path, ...(await writableTempRoots(environment))]
+      : [];
+    validatedImages = await validateImages(images, imageRoots, imageContext, forbiddenRoots);
+  }
+
+  if (typeof options.beforeFinalPathVerification === "function") {
+    await options.beforeFinalPathVerification();
+  }
 
   const catalogPath = path.join(pluginRoot, "config", "deepseek-models.json");
   const model = kind === "vision" ? MODELS.vision : MODELS.coding;
@@ -568,6 +650,12 @@ export async function runDeepSeek({ kind, prompt, workspace_path, mode = "read-o
   // equality with the authorization snapshot so a moved or swapped workspace
   // can never be executed against a different location.
   const verifiedWorkspace = await verifyWorkspaceUnchanged(workspace.path);
+  if (kind === "vision") {
+    const forbiddenRoots = normalizedMode === "workspace-write"
+      ? [verifiedWorkspace, ...(await writableTempRoots(environment))]
+      : [];
+    validatedImages = await revalidateImages(validatedImages, imageRoots, imageContext, forbiddenRoots);
+  }
   const args = buildCodexArgs({
     model,
     workspacePath: verifiedWorkspace,

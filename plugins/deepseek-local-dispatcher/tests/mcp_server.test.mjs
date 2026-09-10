@@ -66,12 +66,24 @@ test("MCP server initializes, advertises bounded tools, and returns secret-free 
     const initialized = await client.request(1, "initialize", { protocolVersion: "2025-06-18", capabilities: {} });
     assert.equal(initialized.result.serverInfo.name, "deepseek-local-dispatcher");
     assert.match(initialized.result.instructions, /Native DeepSeek spawn_agent is not used/);
+    assert.match(initialized.result.instructions, /deepseek-flash/);
 
     const listed = await client.request(2, "tools/list");
     assert.deepEqual(
       listed.result.tools.map((tool) => tool.name),
       ["deepseek_dispatcher_status", "run_deepseek_task", "run_deepseek_vision", "deepseek_grant_instructions"]
     );
+    const visionTool = listed.result.tools.find((tool) => tool.name === "run_deepseek_vision");
+    const taskTool = listed.result.tools.find((tool) => tool.name === "run_deepseek_task");
+    assert.match(taskTool.description, /deepseek-flash/);
+    assert.match(visionTool.description, /deepseek-flash/);
+    assert.equal(taskTool.inputSchema.properties.mode.default, "read-only");
+    assert.equal(visionTool.inputSchema.properties.mode.default, "read-only");
+    assert.deepEqual(visionTool.inputSchema.properties.mode.enum, ["read-only", "workspace-write"]);
+    assert.equal(visionTool.annotations.readOnlyHint, false);
+    assert.equal(visionTool.annotations.destructiveHint, true);
+    assert.match(visionTool.description, /workspace-write only for an already approved visually relevant implementation/);
+    assert.match(visionTool.description, /Source images are always read-only/);
 
     const status = await client.request(3, "tools/call", {
       name: "deepseek_dispatcher_status",

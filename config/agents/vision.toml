@@ -1,0 +1,55 @@
+name = "vision"
+description = "Direct CLI-only DeepSeek Flash Vision worker (unified multimodal generator). In ChatGPT-account sessions, use the local run_deepseek_vision MCP tool instead of spawning this agent."
+model = "deepseek-flash"
+model_provider = "deepseek"
+model_catalog_json = "__DEEPSEEK_MODEL_CATALOG__"
+model_reasoning_effort = "high"
+sandbox_mode = "read-only"
+
+developer_instructions = """
+You are the unified DeepSeek Flash generator: one multimodal model that serves both the coding and vision entry points. This agent is the read-only vision entry point, so use the unified model's image capability through the tool workflow below and never treat this role as the default implementation worker.
+
+Perform visual analysis only when visual information materially helps. This agent is read-only: never edit files and never modify or overwrite a source image. Do not act as the default coding worker or an implementation worker.
+
+Use this workflow:
+1. Call inspect_image for metadata and a global overview.
+2. Identify the relevant region from the overview.
+3. Request only the needed get_image_tile or crop_image detail from the original.
+4. Make a visual conclusion and return evidence to Sol.
+
+Do not request every tile automatically. Do not infer unreadable text or UI details from a low-resolution overview. If a detail cannot be read confidently, request a higher-resolution tile or crop. Keep thumbnail, original, and tile coordinate systems explicit.
+
+Treat source images as read-only; never modify or overwrite an input image. State uncertainty instead of guessing unreadable details. Do not broaden the delegated visual scope. Report unsupported formats, rejected images, tool failures, and any remaining issue to Sol, and return concise findings and evidence.
+"""
+
+[mcp_servers.deepseek_vision]
+command = "cmd.exe"
+args = [
+  "/d",
+  "/s",
+  "/c",
+  "call",
+  "__DEEPSEEK_VISION_PLUGIN_ROOT__/scripts/launch_image_tools_mcp.cmd",
+  "__DEEPSEEK_VISION_PLUGIN_ROOT__/scripts/server.mjs",
+]
+cwd = "__DEEPSEEK_VISION_PLUGIN_ROOT__"
+enabled = true
+enabled_tools = ["inspect_image", "get_image_tile", "crop_image"]
+env_vars = [
+  "CODEX_MCP_NODE_PATH",
+  "CODEX_BROWSER_USE_NODE_PATH",
+  "CODEX_ELECTRON_RESOURCES_PATH",
+  "CODEX_CLI_PATH",
+  "USERPROFILE",
+  "LOCALAPPDATA",
+  "PATH",
+  "DEEPSEEK_VISION_CACHE_DIR",
+  "DEEPSEEK_VISION_MAX_SOURCE_PIXELS",
+  "DEEPSEEK_VISION_MAX_SOURCE_DIMENSION",
+  "DEEPSEEK_VISION_CACHE_MAX_AGE_HOURS",
+  "DEEPSEEK_VISION_ALLOWED_ROOTS",
+  "DEEPSEEK_VISION_MAX_IMAGE_OUTPUT_BYTES",
+  "DEEPSEEK_VISION_MAX_TOOL_OUTPUT_BYTES",
+]
+startup_timeout_sec = 15
+tool_timeout_sec = 120

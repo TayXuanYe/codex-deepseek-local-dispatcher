@@ -120,14 +120,14 @@ const redPixelPng = Buffer.from(
 
 test("buildCodexArgs fixes provider, model, sandbox, catalog, and stdin prompt input", () => {
   const args = buildCodexArgs({
-    model: "deepseek-v4-flash",
+    model: "deepseek-flash",
     workspacePath: "C:\\repo",
     mode: "read-only",
     catalogPath: "C:\\plugin\\models.json"
   });
   assert.equal(args[0], "exec");
   assert.ok(args.includes("--ignore-user-config"));
-  assert.ok(args.includes("deepseek-v4-flash"));
+  assert.ok(args.includes("deepseek-flash"));
   assert.ok(args.includes("read-only"));
   assert.ok(args.includes("model_provider=\"deepseek\""));
   assert.ok(args.includes("approval_policy=\"never\""));
@@ -135,6 +135,55 @@ test("buildCodexArgs fixes provider, model, sandbox, catalog, and stdin prompt i
   assert.ok(args.includes("windows.sandbox=\"elevated\""));
   assert.equal(args.at(-1), "-");
   assert.equal(args.some((value) => value.includes("test-secret")), false);
+});
+
+test("the fixed model catalog exposes exactly one unified deepseek-flash entry", async () => {
+  const pluginCatalog = JSON.parse(
+    await readFile(path.join(pluginRoot, "config", "deepseek-models.json"), "utf8")
+  );
+  assert.equal(pluginCatalog.models.length, 1);
+  const [model] = pluginCatalog.models;
+  assert.equal(model.slug, "deepseek-flash");
+  assert.deepEqual(model.input_modalities, ["text", "image"]);
+  assert.equal(model.supports_image_detail_original, true);
+  assert.match(model.model_messages.instructions_template, /unified multimodal DeepSeek Flash/);
+
+  // The repository catalog and the plugin catalog are shipped as one unified
+  // definition, so they must stay byte-for-byte synchronized.
+  const repositoryCatalog = JSON.parse(
+    await readFile(path.join(pluginRoot, "..", "..", "config", "deepseek-models.json"), "utf8")
+  );
+  assert.deepEqual(pluginCatalog, repositoryCatalog);
+});
+
+test("coding and vision entry points both invoke exactly the unified deepseek-flash model", async () => {
+  const fixture = await fixtureEnvironment();
+  const image = path.join(fixture.root, "image.bin");
+  const codingCapture = {};
+  const visionCapture = {};
+  await writeFile(image, redPixelPng);
+  try {
+    const coding = await runDeepSeek(
+      { kind: "coding", prompt: "Return a test marker without editing files.", workspace_path: fixture.workspace },
+      { environment: fixture.environment, spawnImpl: fakeSpawn(successEvents, codingCapture) }
+    );
+    const vision = await runDeepSeek(
+      { kind: "vision", prompt: "Describe the image.", workspace_path: fixture.workspace, images: [image] },
+      { environment: fixture.environment, spawnImpl: fakeSpawn(successEvents, visionCapture) }
+    );
+    const modelArgument = (args) => args[args.indexOf("--model") + 1];
+    assert.equal(coding.model, "deepseek-flash");
+    assert.equal(vision.model, "deepseek-flash");
+    assert.equal(modelArgument(codingCapture.args), "deepseek-flash");
+    assert.equal(modelArgument(visionCapture.args), "deepseek-flash");
+    assert.equal(modelArgument(visionCapture.args), modelArgument(codingCapture.args));
+    // Only the vision path supplies images, and the coding path never does.
+    assert.equal(codingCapture.args.includes("--image"), false);
+    assert.equal(visionCapture.args[visionCapture.args.indexOf("--image") + 1], image);
+    assert.deepEqual(vision.images, [{ format: "png", bytes: redPixelPng.length }]);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
 });
 
 test("parseCodexJsonl returns the final response and redacts an accidental key echo", () => {
@@ -275,7 +324,8 @@ test("runDeepSeek executes the fixed coding model with a controlled child enviro
       { environment: fixture.environment, spawnImpl: fakeSpawn(successEvents, capture) }
     );
     assert.equal(result.status, "completed");
-    assert.equal(result.model, "deepseek-v4-flash");
+    assert.ok(capture.args.includes("deepseek-flash"));
+    assert.equal(result.model, "deepseek-flash");
     assert.equal(result.mode, "read-only");
     assert.equal(result.response, "DONE");
     assert.equal(capture.options.shell, false);
@@ -286,12 +336,60 @@ test("runDeepSeek executes the fixed coding model with a controlled child enviro
   }
 });
 
-test("runDeepSeek forces Vision to read-only and validates actual PNG content", async () => {
+test("runDeepSeek Vision defaults to read-only and validates actual PNG content", async () => {
   const fixture = await fixtureEnvironment();
   const image = path.join(fixture.root, "image.bin");
   const capture = {};
+  const promptCapture = { text: "" };
+  const wrappedSpawn = (executable, args, options) => {
+    const child = fakeSpawn(successEvents, capture)(executable, args, options);
+    child.stdin.on("data", (chunk) => { promptCapture.text += chunk.toString("utf8"); });
+    return child;
+  };
   await writeFile(image, Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00]));
   try {
+    const result = await runDeepSeek(
+      {
+        kind: "vision",
+        prompt: "Describe the image.",
+        workspace_path: fixture.workspace,
+        images: [image]
+      },
+      { environment: fixture.environment, spawnImpl: wrappedSpawn }
+    );
+    assert.equal(result.model, "deepseek-flash");
+    assert.equal(result.mode, "read-only");
+    assert.deepEqual(result.images, [{ format: "png", bytes: 9 }]);
+    assert.ok(capture.args.includes(image));
+    assert.ok(capture.args.includes("deepseek-flash"));
+    assert.equal(capture.args[capture.args.indexOf("--model") + 1], "deepseek-flash");
+    assert.ok(capture.args.includes("read-only"));
+    assert.equal(capture.args.includes("workspace-write"), false);
+    assert.match(promptCapture.text, /read-only run/);
+    assert.match(promptCapture.text, /Do not modify files/);
+    assert.match(promptCapture.text, /source images as read-only/);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("runDeepSeek Vision workspace-write reaches --sandbox workspace-write with a mode-aware prompt", async () => {
+  const fixture = await fixtureEnvironment();
+  // The image must be inside an allowed root but outside the writable workspace
+  // and outside every writable temp root, so it lives in a unique directory
+  // under the plugin repository instead of under os.tmpdir().
+  const imageRoot = await mkdtemp(path.join(pluginRoot, "deepseek-dispatcher-img-"));
+  const image = path.join(imageRoot, "image.bin");
+  const capture = {};
+  const promptCapture = { text: "" };
+  const wrappedSpawn = (executable, args, options) => {
+    const child = fakeSpawn(successEvents, capture)(executable, args, options);
+    child.stdin.on("data", (chunk) => { promptCapture.text += chunk.toString("utf8"); });
+    return child;
+  };
+  await writeFile(image, Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00]));
+  try {
+    fixture.environment.DEEPSEEK_DISPATCHER_ALLOWED_ROOTS = [fixture.root, imageRoot].join(path.delimiter);
     const result = await runDeepSeek(
       {
         kind: "vision",
@@ -300,14 +398,21 @@ test("runDeepSeek forces Vision to read-only and validates actual PNG content", 
         mode: "workspace-write",
         images: [image]
       },
-      { environment: fixture.environment, spawnImpl: fakeSpawn(successEvents, capture) }
+      { environment: fixture.environment, spawnImpl: wrappedSpawn }
     );
-    assert.equal(result.model, "deepseek-v4-flash-vision-exp");
-    assert.equal(result.mode, "read-only");
+    assert.equal(result.model, "deepseek-flash");
+    assert.equal(result.mode, "workspace-write");
     assert.deepEqual(result.images, [{ format: "png", bytes: 9 }]);
     assert.ok(capture.args.includes(image));
+    assert.equal(capture.args[capture.args.indexOf("--model") + 1], "deepseek-flash");
+    assert.ok(capture.args.includes("workspace-write"));
+    assert.equal(capture.args.includes("read-only"), false);
+    assert.match(promptCapture.text, /only files required by the delegated task/);
+    assert.match(promptCapture.text, /Changed, Validated, and Remaining/);
+    assert.match(promptCapture.text, /source images as read-only/);
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
+    await rm(imageRoot, { recursive: true, force: true });
   }
 });
 
@@ -439,7 +544,7 @@ test("runDeepSeek succeeds for an outside-root workspace with a valid one-time g
       { environment: fixture.environment, spawnImpl: fakeSpawn(successEvents, capture) }
     );
     assert.equal(result.status, "completed");
-    assert.equal(result.model, "deepseek-v4-flash");
+    assert.equal(result.model, "deepseek-flash");
     assert.equal(result.mode, "workspace-write");
     assert.equal(capture.options.shell, false);
     assert.equal(capture.options.cwd, path.resolve(fixture.outsideWorkspace));
@@ -734,6 +839,178 @@ test("an extra grant token is ignored and left unconsumed for an inside-root wor
   }
 });
 
+test("runDeepSeek Vision workspace-write succeeds for an outside-root workspace with a matching grant", async () => {
+  const fixture = await grantRunFixture();
+  // The grant authorizes only the workspace. Workspace-write images must come
+  // from an already trusted static root (never the grant workspace), so the
+  // image lives in a unique non-temp directory added to the static roots.
+  const imageRoot = await mkdtemp(path.join(pluginRoot, "deepseek-dispatcher-static-"));
+  const image = path.join(imageRoot, "img.png");
+  const capture = {};
+  await writeFile(image, redPixelPng);
+  try {
+    fixture.environment.DEEPSEEK_DISPATCHER_ALLOWED_ROOTS = [fixture.staticRoot, imageRoot].join(path.delimiter);
+    const grant = await createGrant({
+      workspacePath: fixture.outsideWorkspace,
+      mode: "workspace-write",
+      ttlSec: 600,
+      environment: fixture.environment
+    });
+    const result = await runDeepSeek(
+      {
+        kind: "vision",
+        prompt: "Describe the image.",
+        workspace_path: fixture.outsideWorkspace,
+        mode: "workspace-write",
+        images: [image],
+        grant_token: grant.grant_token
+      },
+      { environment: fixture.environment, spawnImpl: fakeSpawn(successEvents, capture) }
+    );
+    assert.equal(result.status, "completed");
+    assert.equal(result.model, "deepseek-flash");
+    assert.equal(result.mode, "workspace-write");
+    assert.equal(capture.options.cwd, path.resolve(fixture.outsideWorkspace));
+    assert.equal(capture.options.shell, false);
+    assert.ok(capture.args.includes("workspace-write"));
+    assert.ok(capture.args.includes(image), "the workspace-write image read must use the pretrusted static root");
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+    await rm(imageRoot, { recursive: true, force: true });
+  }
+});
+
+test("runDeepSeek Vision workspace-write rejects an image inside the writable workspace before spawn", async () => {
+  const fixture = await fixtureEnvironment();
+  const image = path.join(fixture.workspace, "img.png");
+  const capture = {};
+  await writeFile(image, redPixelPng);
+  try {
+    await assert.rejects(
+      runDeepSeek(
+        {
+          kind: "vision",
+          prompt: "Describe the image.",
+          workspace_path: fixture.workspace,
+          mode: "workspace-write",
+          images: [image]
+        },
+        { environment: fixture.environment, spawnImpl: fakeSpawn(successEvents, capture) }
+      ),
+      (error) => error instanceof DispatcherError && error.code === "image_not_read_only"
+    );
+    assert.equal(capture.args, undefined, "a workspace-write image inside the workspace must be rejected before spawn");
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("runDeepSeek Vision workspace-write rejects an image inside a writable temp root before spawn", async () => {
+  const fixture = await fixtureEnvironment();
+  // The image is inside the allowed root and outside the workspace but still
+  // inside os.tmpdir() (the fixture root is created under it), which a
+  // workspace-write child could overwrite.
+  const image = path.join(fixture.root, "image.bin");
+  const capture = {};
+  await writeFile(image, redPixelPng);
+  try {
+    await assert.rejects(
+      runDeepSeek(
+        {
+          kind: "vision",
+          prompt: "Describe the image.",
+          workspace_path: fixture.workspace,
+          mode: "workspace-write",
+          images: [image]
+        },
+        { environment: fixture.environment, spawnImpl: fakeSpawn(successEvents, capture) }
+      ),
+      (error) => error instanceof DispatcherError && error.code === "image_not_read_only"
+    );
+    assert.equal(capture.args, undefined, "a workspace-write image inside a temp root must be rejected before spawn");
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("runDeepSeek Vision revalidates an image replaced through a workspace reparse point before spawn", async (context) => {
+  const fixture = await fixtureEnvironment();
+  const imageRoot = await mkdtemp(path.join(pluginRoot, "deepseek-dispatcher-swap-"));
+  const imageDirectory = path.join(imageRoot, "source");
+  const image = path.join(imageDirectory, "img.png");
+  const workspaceImage = path.join(fixture.workspace, "img.png");
+  const capture = {};
+  await mkdir(imageDirectory);
+  await writeFile(image, redPixelPng);
+  await writeFile(workspaceImage, redPixelPng);
+  try {
+    fixture.environment.DEEPSEEK_DISPATCHER_ALLOWED_ROOTS = [fixture.root, imageRoot].join(path.delimiter);
+    let rejected;
+    try {
+      await runDeepSeek(
+        {
+          kind: "vision",
+          prompt: "Describe the image.",
+          workspace_path: fixture.workspace,
+          mode: "workspace-write",
+          images: [image]
+        },
+        {
+          environment: fixture.environment,
+          spawnImpl: fakeSpawn(successEvents, capture),
+          beforeFinalPathVerification: async () => {
+            await rm(imageDirectory, { recursive: true, force: true });
+            await symlink(fixture.workspace, imageDirectory, process.platform === "win32" ? "junction" : "dir");
+          }
+        }
+      );
+    } catch (error) {
+      rejected = error;
+    }
+    if (rejected?.code === "EPERM" || rejected?.code === "EACCES") {
+      context.skip(`reparse-point creation unsupported here: ${rejected.code}`);
+      return;
+    }
+    assert.ok(rejected instanceof DispatcherError && rejected.code === "image_path_changed");
+    assert.equal(capture.args, undefined, "a swapped image path must be rejected before spawn");
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+    await rm(imageRoot, { recursive: true, force: true });
+  }
+});
+
+test("runDeepSeek Vision rejects a mismatched read-only grant for a workspace-write run", async () => {
+  const fixture = await grantRunFixture();
+  const image = path.join(fixture.outsideWorkspace, "img.png");
+  await writeFile(image, redPixelPng);
+  try {
+    const grant = await createGrant({
+      workspacePath: fixture.outsideWorkspace,
+      mode: "read-only",
+      ttlSec: 600,
+      environment: fixture.environment
+    });
+    await assert.rejects(
+      runDeepSeek(
+        {
+          kind: "vision",
+          prompt: "Describe the image.",
+          workspace_path: fixture.outsideWorkspace,
+          mode: "workspace-write",
+          images: [image],
+          grant_token: grant.grant_token
+        },
+        { environment: fixture.environment, spawnImpl: fakeSpawn(successEvents) }
+      ),
+      (error) => error instanceof DispatcherError && error.code === "grant_mismatch"
+    );
+    const grantDir = path.join(fixture.codexHome, "deepseek-dispatcher-grants");
+    assert.deepEqual(await readdir(grantDir), []); // failed claim leaves no artifact
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
 test("Vision images stay inside the authorized grant workspace", async () => {
   const fixture = await grantRunFixture();
   const imageInside = path.join(fixture.outsideWorkspace, "img.png");
@@ -758,7 +1035,7 @@ test("Vision images stay inside the authorized grant workspace", async () => {
       },
       { environment: fixture.environment, spawnImpl: fakeSpawn(successEvents, capture) }
     );
-    assert.equal(result.model, "deepseek-v4-flash-vision-exp");
+    assert.equal(result.model, "deepseek-flash");
     assert.equal(result.mode, "read-only");
 
     const secondGrant = await createGrant({

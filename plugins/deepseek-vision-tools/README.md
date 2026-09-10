@@ -1,7 +1,7 @@
 # DeepSeek Vision Tools
 
 Local, read-only MCP tools for progressive inspection of large screenshots with
-`deepseek-v4-flash-vision-exp`.
+the unified multimodal `deepseek-flash` model.
 
 ## Workflow
 

@@ -1,0 +1,4 @@
+.backups/
+*.tmp
+node_modules/
+test-results/
