@@ -6,6 +6,11 @@ accepts text and image input) through `codex exec`:
 
 - `run_deepseek_task` → `deepseek-flash` (coding entry point)
 - `run_deepseek_vision` → `deepseek-flash` (vision entry point)
+- `start_deepseek_task` / `start_deepseek_vision` → start a run and return its
+  `run_id` without waiting for completion
+- `get_deepseek_run` / `wait_deepseek_run` → inspect a safe run snapshot or
+  wait for its revision to change
+- `cancel_deepseek_run` → idempotently cancel and clean up a run
 - `deepseek_dispatcher_status` → configuration health without secret values
 - `deepseek_grant_instructions` → read-only two-step flow for one-time path grants
 
@@ -15,6 +20,36 @@ arguments, source-image protection, read-only defaults, workspace-write
 boundaries, and visual prompt specialization.
 
 It is a compatibility bridge for environments where ChatGPT-account subagent execution rejects external models. It is not a native subagent thread and does not provide native follow-up or thread UI.
+
+## Asynchronous run lifecycle
+
+Use the blocking `run_deepseek_task` and `run_deepseek_vision` tools for short
+calls where intermediate visibility is unnecessary. For longer work, use:
+
+1. `start_deepseek_task` or `start_deepseek_vision` to obtain a `run_id`.
+2. `get_deepseek_run` for an immediate snapshot, or `wait_deepseek_run` with
+   `after_revision` to wait up to 60 seconds for a change without polling.
+3. `cancel_deepseek_run` when the run should stop.
+
+Run state is separate from health. State progresses through `starting`,
+`running`, and `finalizing` before one terminal state: `completed`, `failed`,
+`cancelled`, or `timed_out`. Health becomes `quiet` after 60 seconds without
+activity and `suspected_stalled` after 300 seconds, but inactivity never ends or
+kills a run. The existing hard timeout remains authoritative.
+
+A complete child turn requires both a final agent message and
+`turn.completed`. The child then receives a 10-second normal-exit grace. If it
+does not exit, the dispatcher cleans the process tree and reports
+`cleanup_forced: true` only after exit is confirmed. An unconfirmed cleanup is
+a `cleanup_failed` terminal error and blocks new runs in that dispatcher
+process instead of claiming success.
+
+Run history is memory-only: at most 50 normalized events per run and 20
+completed runs retained for at most one hour. Concurrent long-poll waiters are
+bounded. Published events are normalized and redacted before storage; raw
+JSONL, raw command output, environment data, grant tokens, allowlist paths, and
+input prompts are not stored in run history. Restarting the MCP process clears
+history.
 
 ## Required environment
 
@@ -110,6 +145,7 @@ without following symlinks.
   writable workspace or the writable temporary roots, and with a one-time grant
   they must come from the static allowed roots rather than the grant workspace.
 - Only one DeepSeek run is active at a time.
+- Run-management calls remain available while that run is active.
 - Timeouts are capped at 30 minutes and captured output is bounded.
 - The child uses `--ignore-user-config` so it does not recursively load this dispatcher.
 - The child fixes `approval_policy="never"`; work requiring additional approval is denied and returned to Sol rather than prompting inside a non-interactive run.

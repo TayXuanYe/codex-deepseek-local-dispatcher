@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { StringDecoder } from "node:string_decoder";
 import { fileURLToPath } from "node:url";
 import {
   GrantError,
@@ -23,6 +24,21 @@ const MAX_PROMPT_CHARS = 64 * 1024;
 const MAX_IMAGES = 5;
 const MAX_IMAGE_BYTES = 32 * 1024 * 1024;
 const MAX_TOTAL_IMAGE_BYTES = 48 * 1024 * 1024;
+// A structurally complete codex exec turn publishes `turn.completed` plus the
+// final `agent_message`. Once both are seen the worker has nothing left to
+// report, so the process is allowed a short exit grace and then the process
+// tree is cleaned up instead of waiting for a child that never exits.
+const DEFAULT_FINALIZE_GRACE_MS = 10_000;
+const DEFAULT_CLEANUP_WAIT_MS = 5_000;
+const STDERR_TAIL_CHARS = 8_192;
+const MAX_EVENT_TEXT_CHARS = 2_000;
+const MAX_EVENT_MESSAGE_CHARS = 500;
+const MAX_EVENT_IDENTIFIER_CHARS = 128;
+
+const defaultTimers = {
+  setTimeout: (callback, delay) => setTimeout(callback, delay),
+  clearTimeout: (handle) => clearTimeout(handle)
+};
 
 // The officially released DeepSeek Flash model is a single unified multimodal
 // generator, so both entry points resolve to exactly one model ID. The coding
@@ -414,39 +430,139 @@ function redact(text, environment, extraSecrets = []) {
   let safe = String(text ?? "");
   const secret = environmentValue(environment, "DEEPSEEK_API_KEY");
   if (secret) safe = safe.split(secret).join("[REDACTED]");
-  for (const value of extraSecrets) {
-    if (typeof value === "string" && value) safe = safe.split(value).join("[REDACTED]");
+  const orderedSecrets = [...new Set(extraSecrets.filter((value) => typeof value === "string" && value))]
+    .sort((left, right) => right.length - left.length);
+  for (const value of orderedSecrets) {
+    if (typeof value !== "string" || !value) continue;
+    safe = safe.split(value).join("[REDACTED]");
+    // Windows paths are case-insensitive and tools may swap slash styles.
+    // Redact those variants too instead of relying on one canonical spelling.
+    if (value.length >= 3 && (path.win32.isAbsolute(value) || path.posix.isAbsolute(value))) {
+      const pattern = value
+        .split(/[\\/]+/)
+        .map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+        .join("[\\\\/]");
+      if (pattern) safe = safe.replace(new RegExp(pattern, "gi"), "[REDACTED]");
+    }
   }
   return safe;
 }
 
-export function parseCodexJsonl(output, environment = process.env, extraSecrets = []) {
-  let threadId = null;
-  let response = null;
-  let usage = null;
-  const failures = [];
-  for (const line of output.split(/\r?\n/)) {
-    if (!line.trim()) continue;
+// Incremental codex exec JSONL reader. `codex exec --json` streams one JSON
+// object per line, so parsing must survive chunk boundaries and a final line
+// without a trailing newline. Only complete lines are decoded; unconsumed bytes
+// stay buffered until the next chunk. Raw JSONL is never published: callers
+// must normalize an event before it can reach a run history.
+export function createCodexJsonlScanner() {
+  let buffer = "";
+  const parse = (line) => {
+    const trimmed = line.trim();
+    if (!trimmed) return null;
     let event;
     try {
-      event = JSON.parse(line);
+      event = JSON.parse(trimmed);
     } catch {
-      continue;
+      return null;
     }
-    if (event.type === "thread.started") threadId = event.thread_id ?? null;
-    if (event.type === "item.completed" && event.item?.type === "agent_message" && typeof event.item.text === "string") {
-      response = event.item.text;
+    return event && typeof event === "object" && !Array.isArray(event) ? event : null;
+  };
+  return {
+    push(text) {
+      buffer += text;
+      const events = [];
+      let index = buffer.indexOf("\n");
+      while (index !== -1) {
+        const event = parse(buffer.slice(0, index));
+        if (event) events.push(event);
+        buffer = buffer.slice(index + 1);
+        index = buffer.indexOf("\n");
+      }
+      return events;
+    },
+    flush() {
+      const event = parse(buffer);
+      buffer = "";
+      return event ? [event] : [];
     }
-    if (event.type === "turn.completed") usage = event.usage ?? null;
-    if (event.type === "turn.failed" || event.type === "error") {
-      failures.push(event.error?.message ?? event.message ?? JSON.stringify(event.error ?? event));
-    }
+  };
+}
+
+// Folds one codex event into the run summary. Shared by the streaming executor
+// and the batch parseCodexJsonl helper so both agree on what a completed turn,
+// a final agent message, and a failure look like.
+export function reduceCodexEvent(state, event) {
+  if (!event || typeof event !== "object") return state;
+  if (event.type === "thread.started") {
+    state.threadId = event.thread_id ?? null;
+  } else if (event.type === "item.completed" && event.item?.type === "agent_message" && typeof event.item.text === "string") {
+    state.response = event.item.text;
+  } else if (event.type === "turn.completed") {
+    state.usage = event.usage ?? null;
+    state.terminalSeen = true;
+  } else if (event.type === "turn.failed" || event.type === "error") {
+    state.failures.push(event.error?.message ?? event.message ?? JSON.stringify(event.error ?? event));
+  }
+  return state;
+}
+
+function boundedText(value, limit) {
+  if (typeof value !== "string") return null;
+  return value.length > limit ? `${value.slice(0, limit)}[truncated]` : value;
+}
+
+function safeUsage(usage) {
+  if (!usage || typeof usage !== "object" || Array.isArray(usage)) return null;
+  const safe = {};
+  for (const [key, value] of Object.entries(usage)) {
+    if (!/^[a-z0-9_.]{1,32}$/.test(key)) continue;
+    if (typeof value === "number" && Number.isFinite(value)) safe[key] = value;
+  }
+  return Object.keys(safe).length > 0 ? safe : null;
+}
+
+// Maps one raw codex exec event onto the bounded, redacted shape allowed to
+// enter run history. Unknown event kinds return null instead of being copied, so
+// no raw stdout, command output, prompt echo, or unparsed JSONL can leak through
+// an unrecognized event type.
+export function normalizeCodexEvent(event, { environment = process.env, secrets = [] } = {}) {
+  if (!event || typeof event !== "object") return null;
+  const clean = (value, limit) => boundedText(redact(value, environment, secrets), limit);
+  switch (event.type) {
+    case "thread.started":
+      return { type: "thread_started", thread_id: clean(event.thread_id, MAX_EVENT_IDENTIFIER_CHARS) };
+    case "item.completed":
+      if (event.item?.type === "agent_message") {
+        return { type: "agent_message", text: clean(event.item.text, MAX_EVENT_TEXT_CHARS) };
+      }
+      return { type: "item_completed", item_type: boundedText(event.item?.type, MAX_EVENT_IDENTIFIER_CHARS) };
+    case "turn.completed":
+      return { type: "turn_completed", usage: safeUsage(event.usage) };
+    case "turn.failed":
+      return {
+        type: "turn_failed",
+        message: clean(event.error?.message ?? event.message ?? "", MAX_EVENT_MESSAGE_CHARS)
+      };
+    case "error":
+      return {
+        type: "error",
+        message: clean(event.error?.message ?? event.message ?? "", MAX_EVENT_MESSAGE_CHARS)
+      };
+    default:
+      return null;
+  }
+}
+
+export function parseCodexJsonl(output, environment = process.env, extraSecrets = []) {
+  const scanner = createCodexJsonlScanner();
+  const state = { threadId: null, response: null, usage: null, terminalSeen: false, failures: [] };
+  for (const event of [...scanner.push(output), ...scanner.flush()]) {
+    reduceCodexEvent(state, event);
   }
   return {
-    thread_id: threadId,
-    response: response ? redact(response, environment, extraSecrets) : null,
-    usage,
-    failures: failures.map((value) => redact(value, environment, extraSecrets))
+    thread_id: state.threadId,
+    response: state.response ? redact(state.response, environment, extraSecrets) : null,
+    usage: state.usage,
+    failures: state.failures.map((value) => redact(value, environment, extraSecrets))
   };
 }
 
@@ -460,20 +576,62 @@ function classifyFailure(text) {
   return "provider_or_cli_error";
 }
 
-function terminateProcessTree(child) {
+// Windows process cleanup for a stopped run. taskkill is awaited to completion
+// (with a bounded fallback) instead of being fire-and-forget, so the caller
+// knows the tree was actually asked to exit before it reports a terminal state.
+async function defaultProcessCleanup(child, timers) {
   if (!child || child.exitCode !== null || child.killed) return;
   if (process.platform === "win32" && child.pid) {
-    const killer = spawn("taskkill.exe", ["/PID", String(child.pid), "/T", "/F"], {
-      stdio: "ignore",
-      windowsHide: true
+    await new Promise((resolve) => {
+      let finished = false;
+      let timeoutHandle = null;
+      const finish = () => {
+        if (finished) return;
+        finished = true;
+        if (timeoutHandle !== null) timers.clearTimeout(timeoutHandle);
+        resolve();
+      };
+      let killer;
+      try {
+        killer = spawn("taskkill.exe", ["/PID", String(child.pid), "/T", "/F"], {
+          stdio: "ignore",
+          windowsHide: true
+        });
+      } catch {
+        finish();
+        return;
+      }
+      killer.once("error", finish);
+      killer.once("close", finish);
+      timeoutHandle = timers.setTimeout(finish, DEFAULT_CLEANUP_WAIT_MS);
     });
-    killer.unref();
     return;
   }
-  child.kill("SIGTERM");
+  try {
+    child.kill("SIGTERM");
+  } catch {
+    // Best-effort cleanup; the caller's watchdog still bounds the run.
+  }
 }
 
-async function executeCodex({ executable, args, prompt, workspacePath, timeoutMs, outputLimit, environment, signal, spawnImpl }) {
+async function executeCodex({
+  executable,
+  args,
+  prompt,
+  workspacePath,
+  timeoutMs,
+  outputLimit,
+  environment,
+  signal,
+  spawnImpl,
+  timers = defaultTimers,
+  hooks = {},
+  sanitizeEvent = null,
+  finalizeGraceMs = DEFAULT_FINALIZE_GRACE_MS,
+  cleanupWaitMs = DEFAULT_CLEANUP_WAIT_MS,
+  processCleanup = null
+}) {
+  const cleanup = processCleanup ?? ((child) => defaultProcessCleanup(child, timers));
   return await new Promise((resolve, reject) => {
     const child = spawnImpl(executable, args, {
       cwd: workspacePath,
@@ -482,51 +640,152 @@ async function executeCodex({ executable, args, prompt, workspacePath, timeoutMs
       stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true
     });
-    const stdout = [];
-    const stderr = [];
+    const scanner = createCodexJsonlScanner();
+    const stdoutDecoder = new StringDecoder("utf8");
+    const stderrDecoder = new StringDecoder("utf8");
+    const state = { threadId: null, response: null, usage: null, terminalSeen: false, failures: [] };
+    let stderrTail = "";
     let stdoutBytes = 0;
     let stderrBytes = 0;
     let stopReason = null;
     let settled = false;
+    let closing = false;
+    let cleanupForced = false;
+    let finalizing = false;
+    let terminationStarted = false;
+    let cleanupPromise = null;
+    let closePayload = null;
+    let hardTimer = null;
+    let graceTimer = null;
+    let watchdogTimer = null;
+
+    const clearTimers = () => {
+      for (const handle of [hardTimer, graceTimer, watchdogTimer]) {
+        if (handle !== null) timers.clearTimeout(handle);
+      }
+    };
+    const buildResult = (code, closeSignal) => ({
+      code,
+      signal: closeSignal,
+      stopReason,
+      cleanupForced,
+      finalizeSeen: finalizing,
+      threadId: state.threadId,
+      response: state.response,
+      usage: state.usage,
+      terminalSeen: state.terminalSeen,
+      failures: state.failures.slice(),
+      stderrTail,
+      stdoutBytes,
+      stderrBytes
+    });
+    const settle = (payload) => {
+      if (settled) return;
+      settled = true;
+      clearTimers();
+      signal?.removeEventListener("abort", onAbort);
+      resolve(payload);
+    };
+
+    // Bounded escalation: ask the tree to exit, then stop waiting on the child
+    // even if it never reports close. The watchdog always settles the promise,
+    // so a wedged process can never hold a run open forever.
+    const beginTermination = () => {
+      if (terminationStarted) return cleanupPromise;
+      terminationStarted = true;
+      cleanupPromise = Promise.resolve()
+        .then(() => cleanup(child))
+        .catch(() => {});
+      void cleanupPromise.finally(() => {
+        if (closePayload !== null) settle(closePayload);
+      });
+      watchdogTimer = timers.setTimeout(() => {
+        cleanupForced = true;
+        if (!stopReason) stopReason = "cleanup_failed";
+        hooks.onCleanup?.({ forced: true });
+        settle(buildResult(child.exitCode, null));
+      }, cleanupWaitMs);
+      return cleanupPromise;
+    };
+
+    function onAbort() {
+      stop("cancelled");
+    }
 
     const stop = (reason) => {
       if (stopReason) return;
       stopReason = reason;
-      terminateProcessTree(child);
+      beginTermination();
     };
-    const timer = setTimeout(() => stop("timeout"), timeoutMs);
-    const onAbort = () => stop("cancelled");
+
+    const handleEvent = (event) => {
+      hooks.onActivity?.();
+      reduceCodexEvent(state, event);
+      const safe = sanitizeEvent ? sanitizeEvent(event) : null;
+      if (safe?.type === "thread_started" && safe.thread_id) hooks.onThread?.(safe.thread_id);
+      if (safe) hooks.onEvent?.(safe);
+      maybeFinalize();
+    };
+
+    // A complete turn is `turn.completed` plus the final `agent_message`. Once
+    // both exist the run is finalizing, not finished: the process still has a
+    // bounded grace to exit on its own before the tree is cleaned up.
+    const maybeFinalize = () => {
+      if (finalizing || settled || closing || stopReason) return;
+      if (!state.terminalSeen || state.response === null) return;
+      finalizing = true;
+      hooks.onFinalizing?.({ graceMs: finalizeGraceMs });
+      graceTimer = timers.setTimeout(() => {
+        cleanupForced = true;
+        hooks.onCleanup?.({ forced: true });
+        hooks.onEvent?.({ type: "cleanup_forced", reason: "exit_grace_expired" });
+        beginTermination();
+      }, finalizeGraceMs);
+    };
+
+    hardTimer = timers.setTimeout(() => stop("timeout"), timeoutMs);
     signal?.addEventListener("abort", onAbort, { once: true });
 
     child.stdout.on("data", (chunk) => {
       stdoutBytes += chunk.length;
-      if (stdoutBytes > outputLimit) return stop("output_limit");
-      stdout.push(chunk);
+      hooks.onActivity?.();
+      if (stdoutBytes > outputLimit) {
+        stop("output_limit");
+        return;
+      }
+      const text = stdoutDecoder.write(chunk);
+      if (!text) return;
+      for (const event of scanner.push(text)) handleEvent(event);
     });
     child.stderr.on("data", (chunk) => {
       stderrBytes += chunk.length;
-      if (stderrBytes > outputLimit) return stop("output_limit");
-      stderr.push(chunk);
+      hooks.onActivity?.();
+      stderrTail = `${stderrTail}${stderrDecoder.write(chunk)}`.slice(-STDERR_TAIL_CHARS);
+      if (stderrBytes > outputLimit) stop("output_limit");
     });
     child.once("error", (error) => {
       if (settled) return;
       settled = true;
-      clearTimeout(timer);
+      clearTimers();
       signal?.removeEventListener("abort", onAbort);
       reject(new DispatcherError("cli_start_failed", "The local Codex CLI could not be started.", error.message));
     });
     child.once("close", (code, closeSignal) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      signal?.removeEventListener("abort", onAbort);
-      resolve({
-        code,
-        signal: closeSignal,
-        stopReason,
-        stdout: Buffer.concat(stdout).toString("utf8"),
-        stderr: Buffer.concat(stderr).toString("utf8")
-      });
+      closing = true;
+      const stdoutRemainder = stdoutDecoder.end();
+      if (stdoutRemainder) {
+        for (const event of scanner.push(stdoutRemainder)) handleEvent(event);
+      }
+      for (const event of scanner.flush()) handleEvent(event);
+      const stderrRemainder = stderrDecoder.end();
+      if (stderrRemainder) stderrTail = `${stderrTail}${stderrRemainder}`.slice(-STDERR_TAIL_CHARS);
+      const payload = buildResult(code, closeSignal);
+      if (terminationStarted && cleanupPromise !== null) {
+        closePayload = payload;
+        void cleanupPromise.finally(() => settle(closePayload));
+        return;
+      }
+      settle(payload);
     });
     child.stdin.on("error", () => {});
     child.stdin.end(prompt, "utf8");
@@ -563,9 +822,19 @@ export async function dispatcherStatus(environment = process.env) {
 export async function runDeepSeek({ kind, prompt, workspace_path, mode = "read-only", images, timeout_sec, grant_token }, options = {}) {
   const environment = options.environment ?? process.env;
   const spawnImpl = options.spawnImpl ?? spawn;
+  const timers = options.timers ?? defaultTimers;
+  const hooks = options.hooks ?? {};
   const startedAt = Date.now();
-  const runId = randomUUID();
+  const runId = typeof options.runId === "string" && options.runId ? options.runId : randomUUID();
   const task = requirePrompt(prompt);
+  const throwIfCancelled = () => {
+    if (!options.signal?.aborted) return;
+    throw new DispatcherError("cancelled", "The DeepSeek run was cancelled.", {
+      run_id: runId,
+      elapsed_ms: Date.now() - startedAt
+    });
+  };
+  throwIfCancelled();
   if (!environmentValue(environment, "DEEPSEEK_API_KEY")) {
     throw new DispatcherError("missing_api_key", "DEEPSEEK_API_KEY is not available to the dispatcher.");
   }
@@ -586,6 +855,7 @@ export async function runDeepSeek({ kind, prompt, workspace_path, mode = "read-o
   if (kind !== "coding" && kind !== "vision") {
     throw new DispatcherError("invalid_argument", "kind must be coding or vision.");
   }
+  throwIfCancelled();
 
   // Authorization snapshot. A workspace already inside the static roots needs
   // no grant (an extra grant_token is intentionally ignored and left
@@ -604,6 +874,9 @@ export async function runDeepSeek({ kind, prompt, workspace_path, mode = "read-o
     workspace = await authorizePath(workspace_path, roots, "directory");
   } catch (error) {
     if (!(error instanceof DispatcherError) || error.code !== "path_not_allowed") throw error;
+    // A cancelled asynchronous run must not burn a one-time grant before a
+    // child can be spawned.
+    throwIfCancelled();
     try {
       grantSnapshot = await claimGrant({
         token: grant_token,
@@ -616,6 +889,7 @@ export async function runDeepSeek({ kind, prompt, workspace_path, mode = "read-o
     }
     workspace = { path: grantSnapshot.workspace, stat: await fs.stat(grantSnapshot.workspace) };
   }
+  throwIfCancelled();
 
   const extraSecrets = typeof grant_token === "string" && grant_token ? [grant_token] : [];
   // Image authorization depends on mode. A one-time grant authorizes only the
@@ -639,6 +913,7 @@ export async function runDeepSeek({ kind, prompt, workspace_path, mode = "read-o
       : [];
     validatedImages = await validateImages(images, imageRoots, imageContext, forbiddenRoots);
   }
+  throwIfCancelled();
 
   if (typeof options.beforeFinalPathVerification === "function") {
     await options.beforeFinalPathVerification();
@@ -663,49 +938,109 @@ export async function runDeepSeek({ kind, prompt, workspace_path, mode = "read-o
     catalogPath,
     imagePaths: validatedImages.map((image) => image.path)
   });
+  // Everything the child prints is untrusted. Secrets, the one-time grant
+  // token, the authorized workspace, and every allowlist root are redacted
+  // before a value can become a run event, a returned result, or an error
+  // detail, so no published value can carry a raw secret or allowlist path.
+  const promptForChild = workerPrompt(kind, task, normalizedMode);
+  const inheritedValues = Object.values(controlledEnvironment(environment))
+    .filter((value) => typeof value === "string" && value.length >= 3);
+  const redactionValues = [...extraSecrets, task, promptForChild, verifiedWorkspace, ...roots, ...inheritedValues];
+  const sanitizeEvent = (event) => normalizeCodexEvent(event, { environment, secrets: redactionValues });
+  // A cancellation that arrived before the child existed must not spawn it.
+  throwIfCancelled();
+  hooks.onRunning?.({ model, mode: normalizedMode });
   const execution = await executeCodex({
     executable,
     args,
-    prompt: workerPrompt(kind, task, normalizedMode),
+    prompt: promptForChild,
     workspacePath: verifiedWorkspace,
     timeoutMs: timeoutSeconds * 1000,
     outputLimit,
     environment,
     signal: options.signal,
-    spawnImpl
+    spawnImpl,
+    timers,
+    hooks,
+    sanitizeEvent,
+    finalizeGraceMs: options.finalizeGraceMs ?? DEFAULT_FINALIZE_GRACE_MS,
+    cleanupWaitMs: options.cleanupWaitMs ?? DEFAULT_CLEANUP_WAIT_MS,
+    processCleanup: options.processCleanup
   });
-  const parsed = parseCodexJsonl(execution.stdout, environment, extraSecrets);
+  hooks.onCleanup?.({ forced: execution.cleanupForced });
   const elapsedMs = Date.now() - startedAt;
   if (execution.stopReason) {
     const messages = {
       timeout: "The DeepSeek run exceeded its configured timeout.",
       cancelled: "The DeepSeek run was cancelled.",
-      output_limit: "The DeepSeek run exceeded its configured output limit."
+      output_limit: "The DeepSeek run exceeded its configured output limit.",
+      cleanup_failed: "The DeepSeek child process did not confirm exit after forced cleanup."
     };
-    throw new DispatcherError(execution.stopReason, messages[execution.stopReason], { run_id: runId, elapsed_ms: elapsedMs });
+    throw new DispatcherError(execution.stopReason, messages[execution.stopReason], {
+      run_id: runId,
+      elapsed_ms: elapsedMs,
+      cleanup_forced: execution.cleanupForced
+    });
   }
-  if (execution.code !== 0 || parsed.failures.length > 0 || !parsed.response) {
-    const diagnostics = redact(
-      [...parsed.failures, execution.stderr].filter(Boolean).join("\n"),
-      environment,
-      extraSecrets
-    ).slice(-8000);
+  const diagnostics = redact(
+    [...execution.failures, execution.stderrTail].filter(Boolean).join("\n"),
+    environment,
+    redactionValues
+  ).slice(-8000);
+  if (execution.failures.length > 0) {
     throw new DispatcherError(
       classifyFailure(diagnostics),
       "The DeepSeek provider or local Codex CLI run failed.",
-      { run_id: runId, exit_code: execution.code, diagnostics }
+      { run_id: runId, exit_code: execution.code, diagnostics, cleanup_forced: execution.cleanupForced }
     );
   }
+  // A terminal turn event is required for success: a clean exit without
+  // `turn.completed` is an explicit incomplete run, not a silent success.
+  if (!execution.terminalSeen) {
+    if (execution.code !== 0) {
+      throw new DispatcherError(
+        classifyFailure(diagnostics),
+        "The DeepSeek provider or local Codex CLI run failed.",
+        { run_id: runId, exit_code: execution.code, diagnostics, cleanup_forced: execution.cleanupForced }
+      );
+    }
+    throw new DispatcherError(
+      "incomplete_run",
+      "The DeepSeek run ended without a terminal turn event.",
+      { run_id: runId, exit_code: execution.code, cleanup_forced: execution.cleanupForced }
+    );
+  }
+  const response = execution.response === null
+    ? null
+    : redact(execution.response, environment, redactionValues);
+  if (response === null) {
+    throw new DispatcherError(
+      "missing_final_response",
+      "The DeepSeek run completed its turn without a final agent message.",
+      { run_id: runId, cleanup_forced: execution.cleanupForced }
+    );
+  }
+  if (execution.code !== 0 && !execution.cleanupForced) {
+    throw new DispatcherError(
+      classifyFailure(diagnostics),
+      "The DeepSeek provider or local Codex CLI run failed.",
+      { run_id: runId, exit_code: execution.code, diagnostics, cleanup_forced: execution.cleanupForced }
+    );
+  }
+  const safeThreadId = execution.threadId === null
+    ? null
+    : boundedText(redact(execution.threadId, environment, redactionValues), MAX_EVENT_IDENTIFIER_CHARS);
   return {
     run_id: runId,
     status: "completed",
     model,
     mode: normalizedMode,
     elapsed_ms: elapsedMs,
-    thread_id: parsed.thread_id,
-    response: parsed.response,
-    usage: parsed.usage,
-    images: validatedImages.map(({ format, bytes }) => ({ format, bytes }))
+    thread_id: safeThreadId,
+    response,
+    usage: safeUsage(execution.usage),
+    images: validatedImages.map(({ format, bytes }) => ({ format, bytes })),
+    cleanup_forced: execution.cleanupForced
   };
 }
 

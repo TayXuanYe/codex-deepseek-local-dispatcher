@@ -61,6 +61,11 @@ The dispatcher exposes:
 deepseek_dispatcher_status
 run_deepseek_task
 run_deepseek_vision
+start_deepseek_task
+start_deepseek_vision
+get_deepseek_run
+wait_deepseek_run
+cancel_deepseek_run
 ```
 
 Sol should use these tools in ChatGPT-account sessions rather than spawning the
@@ -68,6 +73,11 @@ Sol should use these tools in ChatGPT-account sessions rather than spawning the
 read-only; approved visual implementation uses `run_deepseek_vision` with an
 explicit `workspace-write` mode. The returned result is not a native child
 thread; Sol still owns diff review and final validation.
+For longer calls, prefer `start_*` followed by revision-aware `wait_deepseek_run`
+so Sol can inspect progress or cancel the run. Inactivity is reported as
+`active`, `quiet`, or `suspected_stalled`; it never implies completion. A
+terminal DeepSeek event followed by a stuck CLI process enters a bounded cleanup
+phase rather than waiting silently until the full run timeout.
 
 ## Failure and rollback
 

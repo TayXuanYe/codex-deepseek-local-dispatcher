@@ -71,7 +71,17 @@ test("MCP server initializes, advertises bounded tools, and returns secret-free 
     const listed = await client.request(2, "tools/list");
     assert.deepEqual(
       listed.result.tools.map((tool) => tool.name),
-      ["deepseek_dispatcher_status", "run_deepseek_task", "run_deepseek_vision", "deepseek_grant_instructions"]
+      [
+        "deepseek_dispatcher_status",
+        "run_deepseek_task",
+        "run_deepseek_vision",
+        "start_deepseek_task",
+        "start_deepseek_vision",
+        "get_deepseek_run",
+        "wait_deepseek_run",
+        "cancel_deepseek_run",
+        "deepseek_grant_instructions"
+      ]
     );
     const visionTool = listed.result.tools.find((tool) => tool.name === "run_deepseek_vision");
     const taskTool = listed.result.tools.find((tool) => tool.name === "run_deepseek_task");
@@ -92,6 +102,7 @@ test("MCP server initializes, advertises bounded tools, and returns secret-free 
     assert.equal(status.result.isError, false);
     assert.equal(status.result.structuredContent.api_key_present, true);
     assert.equal(status.result.structuredContent.grant_support, true);
+    assert.equal(status.result.structuredContent.cleanup_blocked, false);
     assert.equal(JSON.stringify(status).includes("mcp-test-secret"), false);
 
     const rejected = await client.request(4, "tools/call", {
@@ -109,6 +120,52 @@ test("MCP server initializes, advertises bounded tools, and returns secret-free 
     assert.equal(instructions.result.structuredContent.grant_required, false);
     assert.equal(instructions.result.structuredContent.helper, null);
     assert.equal(instructions.result.structuredContent.workspace, path.resolve(workspace));
+
+    // The async API returns a run id before deep validation finishes. This
+    // outside-root request then becomes a queryable terminal failure without
+    // spawning a real CLI process.
+    const started = await client.request(6, "tools/call", {
+      name: "start_deepseek_task",
+      arguments: { prompt: "test", workspace_path: path.dirname(root) }
+    });
+    assert.equal(started.result.isError, false);
+    const runId = started.result.structuredContent.run_id;
+    assert.equal(typeof runId, "string");
+    assert.equal(started.result.structuredContent.terminal, false);
+
+    const waited = await client.request(7, "tools/call", {
+      name: "wait_deepseek_run",
+      arguments: {
+        run_id: runId,
+        after_revision: started.result.structuredContent.revision,
+        timeout_ms: 5_000
+      }
+    });
+    assert.equal(waited.result.isError, false);
+    assert.equal(waited.result.structuredContent.state, "failed");
+    assert.equal(waited.result.structuredContent.error.code, "grant_required");
+    assert.equal(waited.result.structuredContent.error.details.run_id, runId);
+
+    const fetched = await client.request(8, "tools/call", {
+      name: "get_deepseek_run",
+      arguments: { run_id: runId }
+    });
+    assert.equal(fetched.result.structuredContent.run_id, runId);
+    assert.equal(fetched.result.structuredContent.terminal, true);
+
+    const cancelled = await client.request(9, "tools/call", {
+      name: "cancel_deepseek_run",
+      arguments: { run_id: runId }
+    });
+    assert.equal(cancelled.result.isError, false);
+    assert.equal(cancelled.result.structuredContent.already_terminal, true);
+
+    const finalStatus = await client.request(10, "tools/call", {
+      name: "deepseek_dispatcher_status",
+      arguments: {}
+    });
+    assert.equal(finalStatus.result.structuredContent.busy, false);
+    assert.equal(finalStatus.result.structuredContent.active_run, null);
   } finally {
     await client.close();
     await rm(root, { recursive: true, force: true });

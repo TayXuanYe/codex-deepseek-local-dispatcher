@@ -94,6 +94,7 @@ Use the local MCP tools instead:
 
 * run_deepseek_task for approved, clearly scoped implementation. It defaults to read-only; request workspace-write only when the user has approved implementation.
 * run_deepseek_vision for work where supplied images materially help. It defaults to read-only visual inspection; request workspace-write only when the user has approved a visually relevant implementation. Workspace-write images must come from the static allowed roots and stay outside the writable workspace and the writable temporary roots, so source images remain sandbox-enforced read-only.
+* For longer runs, prefer start_deepseek_task or start_deepseek_vision, then use get_deepseek_run or revision-aware wait_deepseek_run for safe progress snapshots. Use cancel_deepseek_run to stop a run. Inactivity health never completes or kills a run.
 * deepseek_dispatcher_status for configuration diagnostics without exposing secrets.
 
 In direct CLI-only sessions, `vision` remains read-only. Approved visually relevant implementation must use the mode-gated local dispatcher so its workspace, grant, and source-image boundaries are enforced at runtime.

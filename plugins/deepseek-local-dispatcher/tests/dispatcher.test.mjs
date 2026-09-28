@@ -11,8 +11,10 @@ import { promisify } from "node:util";
 import {
   DispatcherError,
   buildCodexArgs,
+  createCodexJsonlScanner,
   deepseekGrantInstructions,
   dispatcherStatus,
+  normalizeCodexEvent,
   parseCodexJsonl,
   resolveCodexExecutable,
   runDeepSeek,
@@ -76,6 +78,78 @@ function delayedSuccessEvents(delayMs) {
       child.emit("close", 0, null);
     }, delayMs);
   };
+}
+
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// Deterministic clock/timer pair so finalization grace and cleanup watchdogs are
+// exercised without waiting for real seconds.
+function fakeClock(startMs = 0) {
+  let now = startMs;
+  let nextId = 1;
+  const timers = new Map();
+  return {
+    now: () => now,
+    timers: {
+      setTimeout(callback, milliseconds) {
+        const id = nextId;
+        nextId += 1;
+        timers.set(id, { due: now + Math.max(0, Number(milliseconds) || 0), callback });
+        return id;
+      },
+      clearTimeout(id) {
+        timers.delete(id);
+      }
+    },
+    advance(milliseconds) {
+      now += milliseconds;
+      let progressed = true;
+      while (progressed) {
+        progressed = false;
+        const due = [...timers.entries()]
+          .filter(([, timer]) => timer.due <= now)
+          .sort((left, right) => left[1].due - right[1].due);
+        for (const [id, timer] of due) {
+          timers.delete(id);
+          timer.callback();
+          progressed = true;
+        }
+      }
+    },
+    pending: () => timers.size
+  };
+}
+
+// A child that reports a complete turn but never exits on its own, so the
+// dispatcher's exit grace and forced cleanup are the only way to finish it.
+function stubbornSpawn(events) {
+  return (executable, args, options) => {
+    const child = new EventEmitter();
+    child.stdin = new PassThrough();
+    child.stdout = new PassThrough();
+    child.stderr = new PassThrough();
+    child.exitCode = null;
+    child.killed = false;
+    child.kill = () => {
+      if (child.killed) return false;
+      child.killed = true;
+      queueMicrotask(() => {
+        child.exitCode = 1;
+        child.emit("close", 1, "SIGTERM");
+      });
+      return true;
+    };
+    child.stdin.once("finish", () => events(child));
+    return child;
+  };
+}
+
+function exitAfterEvents(child, events, code = 0) {
+  for (const event of events) child.stdout.write(`${JSON.stringify(event)}\n`);
+  child.stdout.end();
+  child.stderr.end();
+  child.exitCode = code;
+  child.emit("close", code, null);
 }
 
 async function fixtureEnvironment() {
@@ -149,11 +223,18 @@ test("the fixed model catalog exposes exactly one unified deepseek-flash entry",
   assert.match(model.model_messages.instructions_template, /unified multimodal DeepSeek Flash/);
 
   // The repository catalog and the plugin catalog are shipped as one unified
-  // definition, so they must stay byte-for-byte synchronized.
-  const repositoryCatalog = JSON.parse(
-    await readFile(path.join(pluginRoot, "..", "..", "config", "deepseek-models.json"), "utf8")
-  );
-  assert.deepEqual(pluginCatalog, repositoryCatalog);
+  // definition, so they must stay byte-for-byte synchronized when this test is
+  // running from the source repository. An installed plugin cache contains
+  // only the plugin package, so the repository-level catalog is intentionally
+  // absent there.
+  try {
+    const repositoryCatalog = JSON.parse(
+      await readFile(path.join(pluginRoot, "..", "..", "config", "deepseek-models.json"), "utf8")
+    );
+    assert.deepEqual(pluginCatalog, repositoryCatalog);
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
 });
 
 test("coding and vision entry points both invoke exactly the unified deepseek-flash model", async () => {
@@ -488,6 +569,320 @@ test("runDeepSeek stops a child that exceeds the configured output cap", async (
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }
+});
+
+test("a terminal turn event plus a final agent message completes after the exit grace forces cleanup", async () => {
+  const fixture = await fixtureEnvironment();
+  const clock = fakeClock();
+  const observed = [];
+  const terminalButAlive = (child) => {
+    child.stdout.write(`${JSON.stringify({ type: "thread.started", thread_id: "thread-stuck" })}\n`);
+    child.stdout.write(`${JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: "DONE" } })}\n`);
+    child.stdout.write(`${JSON.stringify({ type: "turn.completed", usage: { input_tokens: 3, output_tokens: 1 } })}\n`);
+    // The reliable terminal events arrived, but this process never exits.
+  };
+  try {
+    const pending = runDeepSeek(
+      { kind: "coding", prompt: "test", workspace_path: fixture.workspace },
+      {
+        environment: fixture.environment,
+        spawnImpl: stubbornSpawn(terminalButAlive),
+        timers: clock.timers,
+        finalizeGraceMs: 10_000,
+        cleanupWaitMs: 5_000,
+        hooks: {
+          onFinalizing: (info) => observed.push(`finalizing:${info.graceMs}`),
+          onCleanup: (info) => observed.push(`cleanup:${info.forced}`),
+          onEvent: (event) => observed.push(`event:${event.type}`)
+        }
+      }
+    );
+    await delay(25);
+    assert.ok(observed.includes("finalizing:10000"), `run should be finalizing before the grace expires: ${observed}`);
+    clock.advance(10_000);
+    const result = await pending;
+    assert.equal(result.status, "completed");
+    assert.equal(result.response, "DONE");
+    assert.equal(result.cleanup_forced, true);
+    assert.equal(result.thread_id, "thread-stuck");
+    assert.deepEqual(result.usage, { input_tokens: 3, output_tokens: 1 });
+    assert.ok(observed.includes("event:cleanup_forced"), `forced cleanup should be published: ${observed}`);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("a hung child that does not confirm forced cleanup fails instead of reporting completed", async () => {
+  const fixture = await fixtureEnvironment();
+  const clock = fakeClock();
+  const terminalButAlive = (child) => {
+    child.stdout.write(`${JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: "DONE" } })}\n`);
+    child.stdout.write(`${JSON.stringify({ type: "turn.completed", usage: { input_tokens: 1 } })}\n`);
+  };
+  try {
+    const pending = runDeepSeek(
+      { kind: "coding", prompt: "test", workspace_path: fixture.workspace },
+      {
+        environment: fixture.environment,
+        spawnImpl: stubbornSpawn(terminalButAlive),
+        timers: clock.timers,
+        finalizeGraceMs: 10_000,
+        cleanupWaitMs: 5_000,
+        processCleanup: async () => {}
+      }
+    );
+    await delay(25);
+    clock.advance(10_000);
+    await delay(0);
+    clock.advance(5_000);
+    await assert.rejects(
+      pending,
+      (error) => error instanceof DispatcherError && error.code === "cleanup_failed"
+    );
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("a clean process exit without a terminal turn event fails explicitly", async () => {
+  const fixture = await fixtureEnvironment();
+  try {
+    await assert.rejects(
+      runDeepSeek(
+        { kind: "coding", prompt: "test", workspace_path: fixture.workspace },
+        {
+          environment: fixture.environment,
+          spawnImpl: fakeSpawn((child) => exitAfterEvents(child, [
+            { type: "thread.started", thread_id: "thread-no-terminal" },
+            { type: "item.completed", item: { type: "agent_message", text: "DONE" } }
+          ]))
+        }
+      ),
+      (error) => error instanceof DispatcherError && error.code === "incomplete_run"
+    );
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("a terminal turn event without a final agent message fails explicitly", async () => {
+  const fixture = await fixtureEnvironment();
+  try {
+    await assert.rejects(
+      runDeepSeek(
+        { kind: "coding", prompt: "test", workspace_path: fixture.workspace },
+        {
+          environment: fixture.environment,
+          spawnImpl: fakeSpawn((child) => exitAfterEvents(child, [
+            { type: "thread.started", thread_id: "thread-silent" },
+            { type: "turn.completed", usage: { input_tokens: 1 } }
+          ]))
+        }
+      ),
+      (error) => error instanceof DispatcherError && error.code === "missing_final_response"
+    );
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("JSONL events split across output chunks are parsed incrementally", async () => {
+  const fixture = await fixtureEnvironment();
+  const captured = [];
+  const chunked = (child) => {
+    const message = `${JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: "CHUNKED-OK" } })}\n`;
+    child.stdout.write(message.slice(0, 12));
+    setImmediate(() => {
+      child.stdout.write(message.slice(12));
+      child.stdout.write(`${JSON.stringify({ type: "turn.completed", usage: { input_tokens: 1 } })}\n`);
+      child.stdout.write(`${JSON.stringify({ type: "thread.started", thread_id: "thread-chunked" })}`);
+    });
+    setImmediate(() => {
+      child.stdout.end();
+      child.stderr.end();
+      child.exitCode = 0;
+      child.emit("close", 0, null);
+    });
+  };
+  try {
+    const result = await runDeepSeek(
+      { kind: "coding", prompt: "test", workspace_path: fixture.workspace },
+      {
+        environment: fixture.environment,
+        spawnImpl: fakeSpawn(chunked),
+        hooks: { onEvent: (event) => captured.push(event) }
+      }
+    );
+    assert.equal(result.response, "CHUNKED-OK");
+    assert.equal(result.thread_id, "thread-chunked");
+    assert.deepEqual(captured.map((event) => event.type), ["agent_message", "turn_completed", "thread_started"]);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("published run events are normalized, bounded, and redacted before history", async () => {
+  const fixture = await grantRunFixture();
+  const captured = [];
+  let capturedThread = null;
+  const apiKey = fixture.environment.DEEPSEEK_API_KEY;
+  try {
+    const grant = await createGrant({
+      workspacePath: fixture.outsideWorkspace,
+      mode: "read-only",
+      ttlSec: 600,
+      environment: fixture.environment
+    });
+    const events = (child) => {
+      child.stdout.write(`${JSON.stringify({ type: "thread.started", thread_id: `thread ${grant.grant_token}` })}\n`);
+      child.stdout.write(`${JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: `finished ${grant.grant_token} ${apiKey}` } })}\n`);
+      // Unrecognized event kinds are dropped instead of copied, so raw command
+      // output and arbitrary nested payloads never reach run history.
+      child.stdout.write(`${JSON.stringify({ type: "item.started", item: { type: "command_execution", command: `dir ${fixture.outsideWorkspace}`, aggregated_output: "listing" } })}\n`);
+      child.stdout.write(`${JSON.stringify({ type: "turn.failed", error: { message: `cannot write ${fixture.outsideWorkspace}` } })}\n`);
+      child.stdout.write("not-json-at-all\n");
+      child.stdout.write(`${JSON.stringify({ type: "turn.completed", usage: { input_tokens: 2, output_tokens: 1 } })}\n`);
+      child.stdout.end();
+      child.stderr.end();
+      child.exitCode = 0;
+      child.emit("close", 0, null);
+    };
+    await assert.rejects(
+      runDeepSeek(
+        { kind: "coding", prompt: "test", workspace_path: fixture.outsideWorkspace, grant_token: grant.grant_token },
+        {
+          environment: fixture.environment,
+          spawnImpl: fakeSpawn(events),
+          hooks: {
+            onEvent: (event) => captured.push(event),
+            onThread: (threadId) => { capturedThread = threadId; }
+          }
+        }
+      ),
+      (error) => error instanceof DispatcherError
+    );
+    const serialized = JSON.stringify(captured);
+    assert.deepEqual(captured.map((event) => event.type), ["thread_started", "agent_message", "turn_failed", "turn_completed"]);
+    assert.equal(captured[1].text, "finished [REDACTED] [REDACTED]");
+    assert.equal(captured[2].message, "cannot write [REDACTED]");
+    assert.equal(capturedThread, "thread [REDACTED]");
+    for (const secret of [grant.grant_token, apiKey, fixture.outsideWorkspace, fixture.staticRoot]) {
+      assert.equal(serialized.includes(secret), false, `run history must not expose ${secret}`);
+    }
+    assert.equal(serialized.includes("command_execution"), false);
+    assert.equal(serialized.includes("not-json-at-all"), false);
+    assert.equal(serialized.includes("aggregated_output"), false);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("managed result fields share run identity and sanitize prompt, environment, thread, and usage", async () => {
+  const fixture = await grantRunFixture();
+  const prompt = "SENSITIVE DELEGATED PROMPT";
+  try {
+    const grant = await createGrant({
+      workspacePath: fixture.outsideWorkspace,
+      mode: "read-only",
+      ttlSec: 600,
+      environment: fixture.environment
+    });
+    const events = (child) => {
+      const pathVariant = fixture.outsideWorkspace.toUpperCase().replaceAll("\\", "/");
+      child.stdout.write(`${JSON.stringify({
+        type: "thread.started",
+        thread_id: `${grant.grant_token} ${fixture.environment.DEEPSEEK_API_KEY} ${pathVariant}`
+      })}\n`);
+      child.stdout.write(`${JSON.stringify({
+        type: "item.completed",
+        item: { type: "agent_message", text: `${prompt} ${fixture.environment.USERPROFILE}` }
+      })}\n`);
+      child.stdout.write(`${JSON.stringify({
+        type: "turn.completed",
+        usage: { input_tokens: 4, output_tokens: 2, note: grant.grant_token, nested: { unsafe: true } }
+      })}\n`);
+      child.stdout.end();
+      child.stderr.end();
+      child.exitCode = 0;
+      child.emit("close", 0, null);
+    };
+    const result = await runDeepSeek(
+      { kind: "coding", prompt, workspace_path: fixture.outsideWorkspace, grant_token: grant.grant_token },
+      { environment: fixture.environment, spawnImpl: fakeSpawn(events), runId: "managed-run-id" }
+    );
+    assert.equal(result.run_id, "managed-run-id");
+    assert.equal(result.response, "[REDACTED] [REDACTED]");
+    assert.equal(result.thread_id.includes("[REDACTED]"), true);
+    assert.deepEqual(result.usage, { input_tokens: 4, output_tokens: 2 });
+    const serialized = JSON.stringify(result);
+    for (const value of [
+      prompt,
+      grant.grant_token,
+      fixture.environment.DEEPSEEK_API_KEY,
+      fixture.environment.USERPROFILE,
+      fixture.outsideWorkspace
+    ]) {
+      assert.equal(serialized.toLowerCase().includes(value.toLowerCase()), false);
+    }
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("an already-cancelled run does not consume its one-time grant", async () => {
+  const fixture = await grantRunFixture();
+  try {
+    const grant = await createGrant({
+      workspacePath: fixture.outsideWorkspace,
+      mode: "read-only",
+      ttlSec: 600,
+      environment: fixture.environment
+    });
+    const controller = new AbortController();
+    controller.abort();
+    await assert.rejects(
+      runDeepSeek(
+        { kind: "coding", prompt: "test", workspace_path: fixture.outsideWorkspace, grant_token: grant.grant_token },
+        { environment: fixture.environment, signal: controller.signal, spawnImpl: fakeSpawn(successEvents) }
+      ),
+      (error) => error instanceof DispatcherError && error.code === "cancelled"
+    );
+    const snapshot = await claimGrant({
+      token: grant.grant_token,
+      workspacePath: fixture.outsideWorkspace,
+      mode: "read-only",
+      environment: fixture.environment
+    });
+    assert.equal(snapshot.workspace, fixture.outsideWorkspace);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("normalizeCodexEvent drops unknown types, truncates text, and bounds usage", () => {
+  const environment = { DEEPSEEK_API_KEY: "event-secret" };
+  assert.equal(normalizeCodexEvent({ type: "item.started", item: { type: "reasoning" } }, { environment }), null);
+  assert.equal(normalizeCodexEvent("turn.completed", { environment }), null);
+  assert.deepEqual(
+    normalizeCodexEvent({ type: "turn.completed", usage: { input_tokens: 5, note: "nope" } }, { environment }),
+    { type: "turn_completed", usage: { input_tokens: 5 } }
+  );
+  const long = normalizeCodexEvent(
+    { type: "item.completed", item: { type: "agent_message", text: "x".repeat(5_000) } },
+    { environment }
+  );
+  assert.equal(long.text.length, 2_000 + "[truncated]".length);
+  assert.equal(long.text.endsWith("[truncated]"), true);
+  const redacted = normalizeCodexEvent(
+    { type: "error", message: "failed with event-secret" },
+    { environment }
+  );
+  assert.equal(redacted.message, "failed with [REDACTED]");
+  const scanner = createCodexJsonlScanner();
+  assert.deepEqual(scanner.push('{"type":"turn.completed"'), []);
+  assert.deepEqual(scanner.push('}\n'), [{ type: "turn.completed" }]);
+  assert.deepEqual(scanner.push('{"type":"turn.completed"}'), []);
+  assert.deepEqual(scanner.flush(), [{ type: "turn.completed" }]);
 });
 
 test("grant helper creates a one-time grant without storing the plaintext token", async () => {
