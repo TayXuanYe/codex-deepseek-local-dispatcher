@@ -104,18 +104,32 @@ const TOOL_DEFINITIONS = [
   },
   {
     name: "get_deepseek_run",
-    description: "Return an immediate safe snapshot of one DeepSeek run: run_id, state, health, revision, timing, model/mode, cleanup flag, terminal result or error, and a bounded redacted event history. Never returns secrets, prompts, allowlist paths, raw command output, or unparsed JSONL.",
+    description: `Return an immediate safe snapshot of one DeepSeek run: run_id, state, health, revision, timing, model/mode, cleanup flag, terminal result or error, and a bounded redacted event window. The window defaults to the latest ${runManagerLimits.default_event_limit} retained events ascending by seq; pass event_from (inclusive) with event_limit to page retained events, and read event_window for the retained range, returned range, next_from, and truncation. Never returns secrets, prompts, allowlist paths, raw command output, or unparsed JSONL.`,
     inputSchema: {
       type: "object",
       additionalProperties: false,
       required: ["run_id"],
-      properties: { run_id: RUN_ID_PROPERTY }
+      properties: {
+        run_id: RUN_ID_PROPERTY,
+        event_from: {
+          type: "integer",
+          minimum: 1,
+          description: "Inclusive event seq to page from. Omit to return the latest event_limit retained events."
+        },
+        event_limit: {
+          type: "integer",
+          minimum: 1,
+          maximum: runManagerLimits.max_event_limit,
+          default: runManagerLimits.default_event_limit,
+          description: "Maximum number of retained events to return."
+        }
+      }
     },
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false }
   },
   {
     name: "wait_deepseek_run",
-    description: `Wait for a DeepSeek run to change. Returns as soon as the run revision moves past after_revision, the run reaches a terminal state, or timeout_ms elapses. Omit after_revision to wait for the next change from the current revision. timeout_ms is bounded by ${runManagerLimits.max_wait_ms} and defaults to ${runManagerLimits.default_wait_ms}.`,
+    description: `Wait for a DeepSeek run to change. Returns as soon as the run revision moves past after_revision, the run reaches a terminal state, or timeout_ms elapses. Omit after_revision to wait for the next change from the current revision. timeout_ms is bounded by ${runManagerLimits.max_wait_ms} and defaults to ${runManagerLimits.default_wait_ms}. The returned snapshot carries the same bounded event window as get_deepseek_run: event_from and event_limit page retained events, and event_window describes the retained/returned range, next_from, and truncation.`,
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -123,7 +137,19 @@ const TOOL_DEFINITIONS = [
       properties: {
         run_id: RUN_ID_PROPERTY,
         after_revision: { type: "integer", minimum: 0, description: "Return only when the run revision is greater than this value." },
-        timeout_ms: { type: "integer", minimum: 0, maximum: runManagerLimits.max_wait_ms, default: runManagerLimits.default_wait_ms }
+        timeout_ms: { type: "integer", minimum: 0, maximum: runManagerLimits.max_wait_ms, default: runManagerLimits.default_wait_ms },
+        event_from: {
+          type: "integer",
+          minimum: 1,
+          description: "Inclusive event seq to page from. Omit to return the latest event_limit retained events."
+        },
+        event_limit: {
+          type: "integer",
+          minimum: 1,
+          maximum: runManagerLimits.max_event_limit,
+          default: runManagerLimits.default_event_limit,
+          description: "Maximum number of retained events to return."
+        }
       }
     },
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false }
@@ -156,7 +182,7 @@ const TOOL_DEFINITIONS = [
   }
 ];
 
-const SERVER_INSTRUCTIONS = "Use run_deepseek_task or run_deepseek_vision for blocking, clearly scoped DeepSeek work, or start_deepseek_task/start_deepseek_vision plus get_deepseek_run, wait_deepseek_run, and cancel_deepseek_run to keep visibility and control while a long run is active. All entry points run the single unified deepseek-flash multimodal model; the coding/vision split only controls image validation, --image arguments, source-image protection, sandbox defaults, and prompt specialization. Exactly one DeepSeek run may be active at a time, and status/get/wait/cancel stay callable while it runs. Terminal state (starting, running, finalizing, completed, failed, cancelled, timed_out) is separate from health (active, quiet after 60 seconds, suspected_stalled after 300 seconds); inactivity never completes or kills a run. run_deepseek_vision defaults to read-only, and workspace-write is allowed only for an approved visually relevant implementation. Workspace-write Vision images must be outside the writable workspace and the writable temporary roots, so source images stay sandbox-enforced read-only. Workspaces inside DEEPSEEK_DISPATCHER_ALLOWED_ROOTS need no grant. For an outside-root workspace, call deepseek_grant_instructions, execute its helper in a separate user-approved exec (argv, no shell), and pass the printed one-time token as grant_token. Human approval is the external Codex exec approval policy and is not proven by this plugin; never rely on MCP annotations or a persistent approval prefix/rule for the helper. The helper stdout carries the one-time token once and may be retained in Codex host or session audit logs, so treat it as a short-lived secret; the dispatcher never returns or logs it. Run history is memory-only, bounded, and redacted. Native DeepSeek spawn_agent is not used in ChatGPT-account sessions. Sol must review changes and run final validation.";
+const SERVER_INSTRUCTIONS = "Use run_deepseek_task or run_deepseek_vision for blocking, clearly scoped DeepSeek work, or start_deepseek_task/start_deepseek_vision plus get_deepseek_run, wait_deepseek_run, and cancel_deepseek_run to keep visibility and control while a long run is active. All entry points run the single unified deepseek-flash multimodal model; the coding/vision split only controls image validation, --image arguments, source-image protection, sandbox defaults, and prompt specialization. Exactly one DeepSeek run may be active at a time, and status/get/wait/cancel stay callable while it runs. Terminal state (starting, running, finalizing, completed, failed, cancelled, timed_out) is separate from health (active, quiet after 60 seconds, suspected_stalled after 300 seconds); inactivity never completes or kills a run. get_deepseek_run and wait_deepseek_run return a bounded event window: the latest 10 retained events by default, or an event_from (inclusive) plus event_limit (1..50) page, with event_window describing the retained/returned range, next_from, and truncation. run_deepseek_vision defaults to read-only, and workspace-write is allowed only for an approved visually relevant implementation. Workspace-write Vision images must be outside the writable workspace and the writable temporary roots, so source images stay sandbox-enforced read-only. Workspaces inside DEEPSEEK_DISPATCHER_ALLOWED_ROOTS need no grant. For an outside-root workspace, call deepseek_grant_instructions, execute its helper in a separate user-approved exec (argv, no shell), and pass the printed one-time token as grant_token. Human approval is the external Codex exec approval policy and is not proven by this plugin; never rely on MCP annotations or a persistent approval prefix/rule for the helper. The helper stdout carries the one-time token once and may be retained in Codex host or session audit logs, so treat it as a short-lived secret; the dispatcher never returns or logs it. Run history is memory-only, bounded, and redacted. Native DeepSeek spawn_agent is not used in ChatGPT-account sessions. Sol must review changes and run final validation.";
 
 function respond(id, result) {
   process.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", id, result })}\n`);
@@ -329,7 +355,9 @@ function waitRunTool(id, args) {
       const snapshot = await manager.waitForRun({
         runId,
         afterRevision: args?.after_revision,
-        timeoutMs: args?.timeout_ms
+        timeoutMs: args?.timeout_ms,
+        eventFrom: args?.event_from,
+        eventLimit: args?.event_limit
       });
       respondOk(id, snapshot);
     } catch (error) {
@@ -402,7 +430,10 @@ async function handle(message) {
         return;
       case "get_deepseek_run": {
         try {
-          const snapshot = manager.getRun(requireRunId(args));
+          const snapshot = manager.getRun(requireRunId(args), {
+            eventFrom: args?.event_from,
+            eventLimit: args?.event_limit
+          });
           if (!snapshot) throw new DispatcherError("unknown_run", "No DeepSeek run matches that run_id.");
           respondOk(id, snapshot);
         } catch (error) {

@@ -53,7 +53,7 @@ export const RUN_HEALTH = Object.freeze({
 });
 
 export const runManagerLimits = Object.freeze({
-  max_events_per_run: 50,
+  max_events_per_run: 200,
   max_retained_runs: 20,
   retention_ms: 3_600_000,
   quiet_ms: 60_000,
@@ -63,7 +63,9 @@ export const runManagerLimits = Object.freeze({
   max_waiters: 64,
   max_waiters_per_run: 8,
   cancel_wait_ms: 5_000,
-  shutdown_wait_ms: 5_000
+  shutdown_wait_ms: 5_000,
+  default_event_limit: 10,
+  max_event_limit: 50
 });
 
 const MAX_EVENT_STRING = 2_000;
@@ -168,7 +170,9 @@ export function createRunManager(options = {}) {
     maxWaiters: options.maxWaiters ?? runManagerLimits.max_waiters,
     maxWaitersPerRun: options.maxWaitersPerRun ?? runManagerLimits.max_waiters_per_run,
     cancelWaitMs: options.cancelWaitMs ?? runManagerLimits.cancel_wait_ms,
-    shutdownWaitMs: options.shutdownWaitMs ?? runManagerLimits.shutdown_wait_ms
+    shutdownWaitMs: options.shutdownWaitMs ?? runManagerLimits.shutdown_wait_ms,
+    defaultEventLimit: options.defaultEventLimit ?? runManagerLimits.default_event_limit,
+    maxEventLimit: options.maxEventLimit ?? runManagerLimits.max_event_limit
   };
 
   const runs = new Map();
@@ -176,7 +180,95 @@ export function createRunManager(options = {}) {
   let activeRunId = null;
   let shuttingDown = false;
 
-  function snapshot(run) {
+  // Every retained safe event carries a monotonic, stable seq that never
+  // changes once assigned. seq is a projection concern only: revision stays the
+  // sole wait-wakeup signal, so event sequence and revision are never
+  // conflated.
+  function appendEvent(run, event, fallback = null) {
+    const safe = sanitizeRunEvent(event) ?? fallback;
+    if (!safe) return false;
+    run.event_seq += 1;
+    run.events.push({ ...safe, seq: run.event_seq });
+    trimEvents(run);
+    return true;
+  }
+
+  // Bounded history: evicting the oldest events is recorded so a reader can
+  // tell that earlier events were truncated and are no longer available.
+  function trimEvents(run) {
+    if (run.events.length <= limits.maxEventsPerRun) return;
+    const removed = run.events.length - limits.maxEventsPerRun;
+    run.events.splice(0, removed);
+    run.dropped_events += removed;
+  }
+
+  function boundedEventLimit(raw) {
+    if (raw === undefined || raw === null) return limits.defaultEventLimit;
+    if (!Number.isSafeInteger(raw) || raw < 1 || raw > limits.maxEventLimit) {
+      throw new RunManagerError(
+        "invalid_argument",
+        `event_limit must be an integer between 1 and ${limits.maxEventLimit}.`
+      );
+    }
+    return raw;
+  }
+
+  function boundedEventFrom(raw) {
+    if (raw === undefined || raw === null) return null;
+    if (!Number.isSafeInteger(raw) || raw < 1) {
+      throw new RunManagerError("invalid_argument", "event_from must be a positive integer.");
+    }
+    return raw;
+  }
+
+  function normalizeEventWindow(options = {}) {
+    return {
+      eventFrom: boundedEventFrom(options.eventFrom),
+      eventLimit: boundedEventLimit(options.eventLimit)
+    };
+  }
+
+  // Selects the retained events a caller asked for and describes the window.
+  // Without event_from the latest event_limit events are returned; with
+  // event_from up to event_limit retained events whose seq is >= event_from are
+  // returned. Both shapes are ascending by seq.
+  function projectEvents(run, eventFrom, eventLimit) {
+    const retainedFrom = run.events.length > 0 ? run.events[0].seq : null;
+    const retainedTo = run.events.length > 0 ? run.events[run.events.length - 1].seq : null;
+    let selected;
+    if (eventFrom === null) {
+      selected = run.events.slice(Math.max(0, run.events.length - eventLimit));
+    } else {
+      selected = [];
+      for (const event of run.events) {
+        if (event.seq < eventFrom) continue;
+        selected.push(event);
+        if (selected.length >= eventLimit) break;
+      }
+    }
+    const returnedFrom = selected.length > 0 ? selected[0].seq : null;
+    const returnedTo = selected.length > 0 ? selected[selected.length - 1].seq : null;
+    const hasMoreAfter = returnedTo !== null && retainedTo !== null && retainedTo > returnedTo;
+    return {
+      events: selected.map(cloneEvent),
+      window: {
+        limit: eventLimit,
+        requested_from: eventFrom,
+        retained_from: retainedFrom,
+        retained_to: retainedTo,
+        retained_count: run.events.length,
+        returned_from: returnedFrom,
+        returned_to: returnedTo,
+        returned_count: selected.length,
+        next_from: hasMoreAfter ? returnedTo + 1 : null,
+        has_more_after: hasMoreAfter,
+        truncated_before: run.dropped_events > 0,
+        dropped_events: run.dropped_events
+      }
+    };
+  }
+
+  function snapshot(run, { eventFrom = null, eventLimit = limits.defaultEventLimit } = {}) {
     const terminal = isTerminalState(run.state);
     const referencePoint = run.last_activity_at ?? run.started_at ?? run.created_at;
     const idleMs = Math.max(0, now() - referencePoint);
@@ -189,6 +281,7 @@ export function createRunManager(options = {}) {
     const latestMessageEvent = [...run.events]
       .reverse()
       .find((event) => typeof event.text === "string" || typeof event.message === "string");
+    const { events, window: eventWindow } = projectEvents(run, eventFrom, eventLimit);
     return {
       run_id: run.run_id,
       kind: run.kind,
@@ -211,14 +304,15 @@ export function createRunManager(options = {}) {
       latest_safe_message: latestMessageEvent?.text ?? latestMessageEvent?.message ?? null,
       result: run.result ? cloneEvent(run.result) : null,
       error: run.error ? cloneEvent(run.error) : null,
-      events: run.events.map(cloneEvent)
+      events,
+      event_window: eventWindow
     };
   }
 
   function resolveWaiter(waiter, run) {
     waiters.delete(waiter);
     if (waiter.timer !== null) timers.clearTimeout(waiter.timer);
-    waiter.resolve(run ? snapshot(run) : null);
+    waiter.resolve(run ? snapshot(run, waiter.eventOptions) : null);
   }
 
   function notify(run) {
@@ -241,14 +335,7 @@ export function createRunManager(options = {}) {
       changed = true;
     }
     if (event !== null) {
-      const safe = sanitizeRunEvent(event);
-      if (safe) {
-        run.events.push(safe);
-        if (run.events.length > limits.maxEventsPerRun) {
-          run.events.splice(0, run.events.length - limits.maxEventsPerRun);
-        }
-        changed = true;
-      }
+      if (appendEvent(run, event)) changed = true;
     }
     if (activity) run.last_activity_at = now();
     if (!changed) return false;
@@ -291,8 +378,8 @@ export function createRunManager(options = {}) {
     return raw;
   }
 
-  function addWaiter(run, timeoutMs, predicate) {
-    if (predicate(run)) return Promise.resolve(snapshot(run));
+  function addWaiter(run, timeoutMs, predicate, eventOptions = {}) {
+    if (predicate(run)) return Promise.resolve(snapshot(run, eventOptions));
     const runWaiters = [...waiters].filter((waiter) => waiter.runId === run.run_id).length;
     if (waiters.size >= limits.maxWaiters || runWaiters >= limits.maxWaitersPerRun) {
       throw new RunManagerError(
@@ -301,7 +388,7 @@ export function createRunManager(options = {}) {
       );
     }
     return new Promise((resolve) => {
-      const waiter = { runId: run.run_id, predicate, resolve, timer: null };
+      const waiter = { runId: run.run_id, predicate, resolve, timer: null, eventOptions };
       if (timeoutMs !== null) {
         waiter.timer = timers.setTimeout(() => resolveWaiter(waiter, run), timeoutMs);
       }
@@ -332,10 +419,7 @@ export function createRunManager(options = {}) {
     run.finished_at = now();
     run.updated_at = run.finished_at;
     run.revision += 1;
-    run.events.push(sanitizeRunEvent({ type: "terminal", state }) ?? { type: "terminal", state });
-    if (run.events.length > limits.maxEventsPerRun) {
-      run.events.splice(0, run.events.length - limits.maxEventsPerRun);
-    }
+    appendEvent(run, { type: "terminal", state }, { type: "terminal", state });
     if (activeRunId === run.run_id) activeRunId = null;
     run.resolveCompletion(snapshot(run));
     notify(run);
@@ -355,10 +439,7 @@ export function createRunManager(options = {}) {
         run.last_activity_at = now();
         run.revision += 1;
         run.updated_at = now();
-        run.events.push(sanitizeRunEvent({ type: "run_started", model: run.model, mode: run.mode }) ?? { type: "run_started" });
-        if (run.events.length > limits.maxEventsPerRun) {
-          run.events.splice(0, run.events.length - limits.maxEventsPerRun);
-        }
+        appendEvent(run, { type: "run_started", model: run.model, mode: run.mode }, { type: "run_started" });
         notify(run);
       },
       onActivity() {
@@ -424,7 +505,9 @@ export function createRunManager(options = {}) {
       mode: null,
       thread_id: null,
       cleanup_forced: null,
-      events: [{ type: "created", kind }],
+      events: [],
+      event_seq: 0,
+      dropped_events: 0,
       result: null,
       error: null,
       abortController: new AbortController(),
@@ -432,6 +515,7 @@ export function createRunManager(options = {}) {
       resolveCompletion
     };
     runs.set(runId, run);
+    appendEvent(run, { type: "created", kind: run.kind });
     activeRunId = runId;
     run.revision += 1;
     run.updated_at = now();
@@ -452,20 +536,27 @@ export function createRunManager(options = {}) {
     return runId;
   }
 
-  function getRun(runId) {
+  function getRun(runId, options = {}) {
+    const eventOptions = normalizeEventWindow(options);
     prune();
     const run = runs.get(runId);
-    return run ? snapshot(run) : null;
+    return run ? snapshot(run, eventOptions) : null;
   }
 
-  function waitForRun({ runId, afterRevision = undefined, timeoutMs = undefined } = {}) {
+  function waitForRun({ runId, afterRevision = undefined, timeoutMs = undefined, eventFrom = undefined, eventLimit = undefined } = {}) {
+    const eventOptions = normalizeEventWindow({ eventFrom, eventLimit });
     const run = requireRun(runId);
     if (afterRevision !== undefined && afterRevision !== null && (!Number.isSafeInteger(afterRevision) || afterRevision < 0)) {
       throw new RunManagerError("invalid_argument", "after_revision must be a non-negative integer.");
     }
     const budget = boundedWait(timeoutMs, limits.defaultWaitMs);
     const baseline = afterRevision === undefined || afterRevision === null ? run.revision : afterRevision;
-    return addWaiter(run, budget, (candidate) => isTerminalState(candidate.state) || candidate.revision > baseline);
+    return addWaiter(
+      run,
+      budget,
+      (candidate) => isTerminalState(candidate.state) || candidate.revision > baseline,
+      eventOptions
+    );
   }
 
   function waitForTerminal(runId, { timeoutMs = null } = {}) {

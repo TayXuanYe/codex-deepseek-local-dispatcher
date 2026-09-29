@@ -1,6 +1,6 @@
 {
   "name": "deepseek-local-dispatcher",
-  "version": "0.1.0+codex.20260928112805",
+  "version": "0.1.0+codex.20260929115314",
   "description": "Bounded local MCP dispatcher for the unified DeepSeek Flash coding and vision worker.",
   "author": {
     "name": "Local developer"

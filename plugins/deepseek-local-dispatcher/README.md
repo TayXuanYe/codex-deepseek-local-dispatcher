@@ -44,12 +44,33 @@ does not exit, the dispatcher cleans the process tree and reports
 a `cleanup_failed` terminal error and blocks new runs in that dispatcher
 process instead of claiming success.
 
-Run history is memory-only: at most 50 normalized events per run and 20
+Run history is memory-only: at most 200 normalized events per run and 20
 completed runs retained for at most one hour. Concurrent long-poll waiters are
 bounded. Published events are normalized and redacted before storage; raw
 JSONL, raw command output, environment data, grant tokens, allowlist paths, and
 input prompts are not stored in run history. Restarting the MCP process clears
 history.
+
+### Event window
+
+Every retained event carries a monotonic, stable `seq`. `get_deepseek_run` and
+`wait_deepseek_run` return only a bounded window of retained events, ascending
+by `seq`; both project the window identically:
+
+- The default window is the latest 10 events.
+- `event_from` (inclusive) plus `event_limit` (1..50, default 10) pages a
+  retained range. Without `event_from`, the latest `event_limit` events are
+  returned.
+- Each snapshot includes `event_window`: `limit` and `requested_from`; the
+  retained range as `retained_from`/`retained_to`/`retained_count`; the
+  returned range as `returned_from`/`returned_to`/`returned_count`; the
+  `next_from` cursor plus `has_more_after` for forward paging; and
+  `truncated_before`/`dropped_events`, which are set when the oldest events were
+  evicted and are no longer available.
+
+`revision` remains the only wakeup signal for `wait_deepseek_run` and is never
+conflated with the event `seq`. Terminal `result` and `error` are returned in
+full and are never windowed.
 
 ## Required environment
 

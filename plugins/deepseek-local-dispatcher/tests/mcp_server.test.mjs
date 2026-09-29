@@ -39,8 +39,23 @@ function startServer(environment) {
     });
   }
   async function close() {
+    if (server.exitCode !== null) return;
+    const exited = new Promise((resolve) => server.once("exit", resolve));
     server.stdin.end();
-    await new Promise((resolve) => server.once("exit", resolve));
+    let closeTimer;
+    const closeTimeout = new Promise((resolve) => {
+      closeTimer = setTimeout(() => resolve(false), 5_000);
+    });
+    const closed = await Promise.race([
+      exited.then(() => true),
+      closeTimeout
+    ]);
+    clearTimeout(closeTimer);
+    if (!closed) {
+      server.kill();
+      await exited;
+      throw new Error(`Timed out waiting for the MCP test server to exit; stderr=${stderr}`);
+    }
   }
   return { server, request, close };
 }
@@ -94,6 +109,17 @@ test("MCP server initializes, advertises bounded tools, and returns secret-free 
     assert.equal(visionTool.annotations.destructiveHint, true);
     assert.match(visionTool.description, /workspace-write only for an already approved visually relevant implementation/);
     assert.match(visionTool.description, /Source images are always read-only/);
+
+    const getTool = listed.result.tools.find((tool) => tool.name === "get_deepseek_run");
+    const waitTool = listed.result.tools.find((tool) => tool.name === "wait_deepseek_run");
+    for (const tool of [getTool, waitTool]) {
+      assert.equal(tool.inputSchema.properties.event_limit.default, 10);
+      assert.equal(tool.inputSchema.properties.event_limit.minimum, 1);
+      assert.equal(tool.inputSchema.properties.event_limit.maximum, 50);
+      assert.equal(tool.inputSchema.properties.event_from.minimum, 1);
+    }
+    assert.match(getTool.description, /latest 10 retained events/);
+    assert.match(getTool.description, /event_window/);
 
     const status = await client.request(3, "tools/call", {
       name: "deepseek_dispatcher_status",
@@ -166,6 +192,54 @@ test("MCP server initializes, advertises bounded tools, and returns secret-free 
     });
     assert.equal(finalStatus.result.structuredContent.busy, false);
     assert.equal(finalStatus.result.structuredContent.active_run, null);
+
+    // The immediate snapshot returns a bounded, seq-tagged event window by
+    // default (created + terminal for this failure), never the unbounded history.
+    const windowed = await client.request(11, "tools/call", {
+      name: "get_deepseek_run",
+      arguments: { run_id: runId }
+    });
+    assert.equal(windowed.result.isError, false);
+    const defaultWindow = windowed.result.structuredContent.event_window;
+    assert.equal(defaultWindow.limit, 10);
+    assert.equal(defaultWindow.requested_from, null);
+    assert.equal(defaultWindow.retained_from, 1);
+    assert.equal(defaultWindow.returned_from, 1);
+    assert.equal(defaultWindow.returned_count, windowed.result.structuredContent.events.length);
+    assert.equal(defaultWindow.truncated_before, false);
+    for (const event of windowed.result.structuredContent.events) {
+      assert.equal(Number.isSafeInteger(event.seq), true);
+    }
+
+    // A windowed get pages retained events by event_from plus event_limit.
+    const paged = await client.request(12, "tools/call", {
+      name: "get_deepseek_run",
+      arguments: { run_id: runId, event_from: 1, event_limit: 1 }
+    });
+    assert.equal(paged.result.isError, false);
+    assert.equal(paged.result.structuredContent.events.length, 1);
+    assert.equal(paged.result.structuredContent.events[0].seq, 1);
+    assert.equal(paged.result.structuredContent.event_window.limit, 1);
+    assert.equal(paged.result.structuredContent.event_window.requested_from, 1);
+    assert.equal(paged.result.structuredContent.event_window.next_from, 2);
+    assert.equal(paged.result.structuredContent.event_window.has_more_after, true);
+
+    // Invalid window arguments are rejected as a tool error, not a crash.
+    const badLimit = await client.request(13, "tools/call", {
+      name: "get_deepseek_run",
+      arguments: { run_id: runId, event_limit: 0 }
+    });
+    assert.equal(badLimit.result.isError, true);
+    assert.equal(badLimit.result.structuredContent.error.code, "invalid_argument");
+
+    // wait_deepseek_run projects the identical window shape.
+    const waitedWindow = await client.request(14, "tools/call", {
+      name: "wait_deepseek_run",
+      arguments: { run_id: runId, after_revision: 0, event_from: 2, event_limit: 5 }
+    });
+    assert.equal(waitedWindow.result.isError, false);
+    assert.equal(waitedWindow.result.structuredContent.event_window.requested_from, 2);
+    assert.equal(waitedWindow.result.structuredContent.terminal, true);
   } finally {
     await client.close();
     await rm(root, { recursive: true, force: true });
