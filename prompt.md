@@ -45,7 +45,7 @@ Ask clarifying questions only when missing information would materially change t
 
 Use models by capability, not by fixed percentages.
 
-## GPT-5.6 Sol — Main Agent
+## GPT-6 Sol — Main Agent
 
 Sol is the default orchestrator and planner.
 
@@ -68,7 +68,7 @@ Do not blindly trust subagent output.
 
 ---
 
-## GPT-5.6 Luna — Explore Worker
+## GPT-6 Luna — Explore Worker
 
 Use Luna for:
 
@@ -143,7 +143,7 @@ Do not describe or route to a separate DeepSeek Vision model. In these instructi
 
 ---
 
-## GPT-5.6 Terra — Escalation Model
+## GPT-6 Terra — Escalation Model
 
 Use Terra when the task requires unusually strong judgment, risk analysis, or difficult reasoning.
 
