@@ -143,30 +143,6 @@ Do not describe or route to a separate DeepSeek Vision model. In these instructi
 
 ---
 
-## GPT-6 Terra — Escalation Model
-
-Use Terra when the task requires unusually strong judgment, risk analysis, or difficult reasoning.
-
-Escalate to Terra for:
-
-* difficult debugging
-* subtle concurrency issues
-* architecture changes
-* ambiguous system behavior
-* security-sensitive implementation
-* database strategy decisions
-* distributed systems problems
-* complex cross-service failures
-* difficult performance problems
-* conflicting requirements
-* complex review of high-risk changes
-* repeated failure by a normal worker
-* cases where correctness cannot be confidently determined
-
-Terra should be used because the problem is cognitively difficult or high-risk, not merely because the codebase is large.
-
----
-
 # Delegation Rules
 
 Delegate when:
@@ -204,7 +180,7 @@ Default flow:
 Sol
 ├── Luna          → find and understand
 ├── DeepSeek      → unified text, code, and visual implementation
-└── Terra         → handle difficult/high-risk reasoning
+└── Sol           → handle difficult/high-risk reasoning
 ```
 
 Use this principle:
@@ -212,7 +188,6 @@ Use this principle:
 ```text
 Luna     = discover
 DeepSeek = implement text, code, and visual work with `deepseek-flash`
-Terra    = escalate
 Sol      = plan, route, integrate, review, validate
 ```
 
