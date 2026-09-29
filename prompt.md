@@ -486,6 +486,9 @@ For DeepSeek implementation workers specifically:
 - Treat long first-response latency as normal for substantial repository work.
 - Do not interpret silence alone as failure.
 - Prefer task completion over frequent intermediate reporting.
+- When polling a running DeepSeek generator for status, use a recommended
+  interval of 5 minutes between polls. Poll sooner only when an explicit error,
+  completion signal, or need for user intervention requires it.
 - For clearly scoped implementation, allow at least 45 minutes before considering
   takeover unless there is explicit evidence of failure.
 - If the worker is still showing progress, continue waiting up to 60 minutes for
